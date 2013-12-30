@@ -94,6 +94,29 @@ static NSCharacterSet* kIllegalNameChars;
     return [path stringByAppendingPathComponent: @"CouchbaseLite"];
 }
 
+static CBLFilterIdBlock sFilterIdBlock;
+
+
++ (void) setFilterIdBlock: (CBLFilterIdBlock)filterIdBlock {
+    sFilterIdBlock = filterIdBlock;
+}
+
++ (CBLFilterIdBlock) filterIdBlock {
+    return sFilterIdBlock;
+}
+
+static CBLBulkGetBlock sBulkGetBlock;
+
+
++ (void) setBulkGetBlock: (CBLBulkGetBlock)bulkGetBlock {
+    sBulkGetBlock = bulkGetBlock;
+}
+
++ (CBLBulkGetBlock) bulkGetBlock {
+    return sBulkGetBlock;
+}
+
+
 
 static CBLManager* sInstance;
 
@@ -644,6 +667,7 @@ static NSDictionary* parseSourceOrTarget(NSDictionary* properties, NSString* key
         *outStatus = kCBLStatusOK;
     return repl;
 }
+
 
 
 @end

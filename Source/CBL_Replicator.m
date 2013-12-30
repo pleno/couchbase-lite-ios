@@ -31,7 +31,7 @@
 
 
 #define kProcessDelay 0.5
-#define kInboxCapacity 100
+#define kInboxCapacity 500
 
 #define kRetryDelay 60.0
 

@@ -27,6 +27,10 @@ typedef BOOL (^CBLFilterBlock) (CBLSavedRevision* revision, NSDictionary* params
 #define FILTERBLOCK(BLOCK) ^BOOL(CBLSavedRevision* revision, NSDictionary* params) {BLOCK}
 
 
+
+
+
+
 /** An external object that knows how to convert source code into an executable filter. */
 @protocol CBLFilterCompiler <NSObject>
 - (CBLFilterBlock) compileFilterFunction: (NSString*)filterSource language: (NSString*)language;

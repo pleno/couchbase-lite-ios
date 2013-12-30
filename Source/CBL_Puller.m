@@ -37,7 +37,7 @@
 #define kMaxOpenHTTPConnections 12
 
 // Maximum number of revs to fetch in a single bulk request
-#define kMaxRevsToGetInBulk 50u
+#define kMaxRevsToGetInBulk 500u
 
 
 @interface CBL_Puller () <CBLChangeTrackerClient>
@@ -223,6 +223,17 @@ static NSString* joinQuotedEscaped(NSArray* strings);
     if (![CBLDatabase isValidDocumentID: docID])
         return;
     
+    
+    CBLFilterIdBlock block = [CBLManager filterIdBlock];
+    
+    if (block != nil) {
+        
+        if (!block(docID)) {
+            return;
+        }
+        
+    }
+    
     for (NSString* revID in revIDs) {
         // Push each revision info to the inbox
         CBLPulledRevision* rev = [[CBLPulledRevision alloc] initWithDocID: docID
@@ -317,7 +328,7 @@ static NSString* joinQuotedEscaped(NSArray* strings);
     // Dump the revs into the queues of revs to pull from the remote db:
     unsigned numBulked = 0;
     for (CBLPulledRevision* rev in inbox.allRevisions) {
-        if (_canBulkGet || (rev.generation == 1 && !rev.deleted && !rev.conflicted)) {
+        if ([CBLManager bulkGetBlock] || _canBulkGet || (rev.generation == 1 && !rev.deleted && !rev.conflicted)) {
             // Optimistically pull 1st-gen revs in bulk:
             if (!_bulkRevsToPull) 
                 _bulkRevsToPull = [[NSMutableArray alloc] initWithCapacity: 100];
@@ -456,6 +467,17 @@ static NSString* joinQuotedEscaped(NSArray* strings);
     LogTo(Sync, @"%@ bulk-fetching %u remote revisions...", self, (unsigned)nRevs);
     LogTo(SyncVerbose, @"%@ bulk-fetching remote revisions: %@", self, bulkRevs);
 
+    
+    if ([CBLManager bulkGetBlock]) {
+        
+        [self pullBulkWithBulkGetBlock: bulkRevs];
+        return;
+        
+        
+    }
+    
+    
+    
     if (!_canBulkGet) {
         // _bulk_get is not supported, so fall back to _all_docs:
         [self pullBulkWithAllDocs: bulkRevs];
@@ -525,6 +547,72 @@ static NSString* joinQuotedEscaped(NSArray* strings);
     [dl start];
 }
 
+- (void)pullBulkWithBulkGetBlock:(NSArray *)bulkRevs {
+    CBLBulkGetBlock block = [CBLManager bulkGetBlock];
+    __weak CBL_Puller *weakSelf = self;
+    NSMutableArray* remainingRevs = [bulkRevs mutableCopy];
+    [self asyncTaskStarted];
+    ++_httpConnectionCount;
+    
+    NSArray* keys = [bulkRevs my_map: ^(CBL_Revision* rev) { return rev.docID; }];
+    
+
+    void (^onDocument)(NSDictionary *) = ^(NSDictionary* props) {
+        // Got a revision!
+        __strong CBL_Puller *strongSelf = weakSelf;
+        // Find the matching revision in 'remainingRevs' and get its sequence:
+        CBL_Revision* rev;
+        if (props[@"_id"])
+            rev = [CBL_Revision revisionWithProperties: props];
+        else
+            rev = [[CBL_Revision alloc] initWithDocID: props[@"id"]
+                                                revID: props[@"rev"] deleted: NO];
+        NSUInteger pos = [remainingRevs indexOfObject: rev];
+        if (pos != NSNotFound) {
+            rev.sequence = [remainingRevs[pos] sequence];
+            [remainingRevs removeObjectAtIndex: pos];
+            [strongSelf asyncTaskStarted];
+            [rev.body compact];
+            [strongSelf->_downloadsToInsert queueObject: rev];
+        } else {
+            Warn(@"%@: Received unexpected rev %@", self, rev);
+        }
+
+
+    };
+    void (^onCompletion)(NSError *) = ^(NSError *error) {
+        // The entire _bulk_get is finished:
+        __strong CBL_Puller *strongSelf = weakSelf;
+        if (error) {
+            strongSelf.error = error;
+            [strongSelf revisionFailed];
+            strongSelf.changesProcessed += remainingRevs.count;
+        }  else {
+
+
+            // Any leftover revisions that didn't get matched will be fetched individually:
+            if (remainingRevs.count) {
+                LogTo(Sync, @"%@ bulk-fetch didn't work for %u of %u revs; getting individually",
+                self, (unsigned)remainingRevs.count, (unsigned)bulkRevs.count);
+                for (CBL_Revision* rev in remainingRevs)
+                    [self queueRemoteRevision: rev];
+                [self pullRemoteRevisions];
+            }
+        }
+
+
+        // Note that we've finished this task:
+        [self asyncTasksFinished: 1];
+        --_httpConnectionCount;
+        // Start another task if there are still revisions waiting to be pulled:
+        [strongSelf pullRemoteRevisions];
+    };
+
+
+    block(_remote, _db, keys, onDocument, onCompletion);
+    
+}
+
 
 // Get as many revisions as possible in one _all_docs request.
 // This is compatible with CouchDB, but it only works for revs of generation 1 without attachments.
@@ -564,11 +652,11 @@ static NSString* joinQuotedEscaped(NSArray* strings);
                           }
                       }
                   }
-                  
+
                   // Any leftover revisions that didn't get matched will be fetched individually:
                   if (remainingRevs.count) {
                       LogTo(Sync, @"%@ bulk-fetch didn't work for %u of %u revs; getting individually",
-                            self, (unsigned)remainingRevs.count, (unsigned)bulkRevs.count);
+                      self, (unsigned)remainingRevs.count, (unsigned)bulkRevs.count);
                       for (CBL_Revision* rev in remainingRevs)
                           [self queueRemoteRevision: rev];
                       [self pullRemoteRevisions];

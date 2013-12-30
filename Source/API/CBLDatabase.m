@@ -186,8 +186,10 @@ static id<CBLFilterCompiler> sFilterCompiler;
 
 - (BOOL) closeForDeletion {
     // There is no need to save any changes!
-    for (CBLModel* model in _unsavedModelsMutable)
-        model.needsSave = false;
+
+    // This causes error because the collection is changed while enumerating
+    //for (CBLModel* model in _unsavedModelsMutable)
+    //    model.needsSave = false;
     _unsavedModelsMutable = nil;
     [self close];
     [_manager _forgetDatabase: self];

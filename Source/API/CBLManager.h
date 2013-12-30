@@ -7,6 +7,7 @@
 //
 
 #import <Foundation/Foundation.h>
+#import "CBLManager.h"
 @class CBLDatabase;
 
 
@@ -14,6 +15,17 @@
 typedef struct CBLManagerOptions {
     bool readOnly;      /**< No modifications to databases are allowed. */
 } CBLManagerOptions;
+
+
+/** Filter id block, used in replication to pre-validate based on id. */
+typedef BOOL (^CBLFilterIdBlock) (NSString* documentId);
+
+
+typedef void (^CBLBulkGetBlockOnDocument)(NSDictionary *);
+
+typedef void (^CBLBulkGetBlockOnCompletion)(NSError *);
+
+typedef void (^CBLBulkGetBlock) (NSURL* url, __weak CBLDatabase * database, NSArray * bulkRevs, CBLBulkGetBlockOnDocument onDocument, CBLBulkGetBlockOnCompletion onCompletion);
 
 
 /** Top-level CouchbaseLite object; manages a collection of databases as a CouchDB server does.
@@ -105,6 +117,15 @@ typedef struct CBLManagerOptions {
 - (void) backgroundTellDatabaseNamed: (NSString*)dbName to: (void (^)(CBLDatabase*))block;
 
 #pragma mark - OTHER API:
+
+
+/** A block to prevalidate all pull replications before they are fetched. Return YES if the document is to replicated. */
++ (void) setFilterIdBlock: (CBLFilterIdBlock)filterIdBlock;
++ (CBLFilterIdBlock) filterIdBlock;
+
+
++ (void) setBulkGetBlock: (CBLBulkGetBlock)bulkGetBlock;
++ (CBLBulkGetBlock) bulkGetBlock;
 
 /** The base URL of the database manager's REST API. You can access this URL within this process,
     using NSURLConnection or other APIs that use that (such as XMLHTTPRequest inside a WebView),
