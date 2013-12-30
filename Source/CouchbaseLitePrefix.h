@@ -24,5 +24,6 @@
 
 
 // Configuration for the sqlite3-unicodesn library:
-#define SQLITE_ENABLE_FTS4 
+#define SQLITE_ENABLE_FTS4
 #define SQLITE_ENABLE_FTS4_UNICODE61
+
