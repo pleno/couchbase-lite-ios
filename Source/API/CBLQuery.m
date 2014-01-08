@@ -619,6 +619,16 @@ static id fromJSON( NSData* json ) {
 #ifdef CBL_DEPRECATED
 - (UInt64) localSequence {return _sequence;}
 - (NSString*) documentRevision {return self.documentRevisionID;}
+
+- (id)copyWithZone:(NSZone *)zone {
+    return self;
+}
+
+- (NSUInteger)hash
+{
+    return [_key hash] ^ [_value hash] ^ [_sourceDocID hash];
+}
+
 #endif
 
 

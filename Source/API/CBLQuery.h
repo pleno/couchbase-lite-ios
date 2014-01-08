@@ -175,7 +175,7 @@ typedef enum {
 
 /** A result row from a CouchbaseLite view query.
     Full-text and geo queries return subclasses -- see CBLFullTextQueryRow and CBLGeoQueryRow. */
-@interface CBLQueryRow : NSObject
+@interface CBLQueryRow : NSObject <NSCopying>
 
 /** The row's key: this is the first parameter passed to the emit() call that generated the row. */
 @property (readonly) id key;
