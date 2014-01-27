@@ -610,8 +610,8 @@ static id fromJSON( NSData* json ) {
 - (NSString*) description {
     return [NSString stringWithFormat: @"%@[key=%@; value=%@; id=%@]",
             [self class],
-            [CBLJSON stringWithJSONObject: self.key options: CBLJSONWritingAllowFragments error: nil],
-            [CBLJSON stringWithJSONObject: self.value options: CBLJSONWritingAllowFragments error: nil],
+            [CBLJSON stringWithJSONObject: self.key options: CBLJSONWritingAllowFragments error: nil] ?: @"",
+            [CBLJSON stringWithJSONObject: self.value options: CBLJSONWritingAllowFragments error: nil] ?: @"",
             self.documentID];
 }
 
