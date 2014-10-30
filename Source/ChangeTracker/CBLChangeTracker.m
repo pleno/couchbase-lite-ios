@@ -24,7 +24,7 @@
 #import "CBLJSONReader.h"
 
 
-#define kDefaultHeartbeat (5 * 60.0)
+#define kDefaultHeartbeat (20.0)
 
 #define kInitialRetryDelay 2.0      // Initial retry delay (doubles after every subsequent failure)
 #define kMaxRetryDelay (10*60.0)    // ...but will never get longer than this
