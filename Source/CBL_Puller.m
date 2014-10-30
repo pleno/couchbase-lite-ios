@@ -95,13 +95,9 @@ static NSString* joinQuotedEscaped(NSArray* strings);
         }
     }
 
-    CBLChangeTrackerMode mode;
-    if (!_continuous || pollInterval > 0.0)
-        mode = kOneShot;
-    else if (self.canUseWebSockets)
+    CBLChangeTrackerMode mode = kOneShot;
+    if (_continuous && pollInterval == 0.0 && self.canUseWebSockets)
         mode = kWebSocket;
-    else
-        mode = _caughtUp ? kLongPoll : kOneShot;
     LogTo(SyncVerbose, @"%@ starting ChangeTracker: mode=%d, since=%@", self, mode, _lastSequence);
     _changeTracker = [[CBLChangeTracker alloc] initWithDatabaseURL: _remote
                                                               mode: mode
@@ -114,6 +110,7 @@ static NSString* joinQuotedEscaped(NSArray* strings);
     _changeTracker.filterParameters = _filterParameters;
     _changeTracker.docIDs = _docIDs;
     _changeTracker.authorizer = _authorizer;
+    _changeTracker.usePOST = [self serverIsSyncGatewayVersion: @"0.93"];
 
     unsigned heartbeat = $castIf(NSNumber, _options[kCBLReplicatorOption_Heartbeat]).unsignedIntValue;
     if (heartbeat >= 15000)
@@ -126,7 +123,7 @@ static NSString* joinQuotedEscaped(NSArray* strings);
     _changeTracker.requestHeaders = headers;
     
     [_changeTracker start];
-    if (!_continuous)
+    if (!_changeTracker.continuous)
         [self asyncTaskStarted];
 }
 
@@ -135,13 +132,8 @@ static NSString* joinQuotedEscaped(NSArray* strings);
     id option = _options[@"websocket"];
     if (option)
         return [option boolValue];
-    BOOL isSG = [_serverType hasPrefix: @"Couchbase Sync Gateway/"]
-             && [_serverType compare: @"Couchbase Sync Gateway/0.91"] >= 0;
-    if (!isSG)
-        return NO;
-    if (self.remote.my_proxySettings != nil)    // WebSocket class doesn't support proxies yet
-        return NO;
-    return YES;
+    return [self serverIsSyncGatewayVersion: @"0.91"]
+        && self.remote.my_proxySettings == nil;    // WebSocket class doesn't support proxies yet
 }
 
 
@@ -150,10 +142,11 @@ static NSString* joinQuotedEscaped(NSArray* strings);
         return;
     LogTo(Sync, @"%@ STOPPING...", self);
     if (_changeTracker) {
+        BOOL continous = _changeTracker.continuous;
         _changeTracker.client = nil;  // stop it from calling my -changeTrackerStopped
         [_changeTracker stop];
         _changeTracker = nil;
-        if (!_continuous)
+        if (!continous)
             [self asyncTasksFinished: 1]; // balances -asyncTaskStarted in -startChangeTracker
         if (!_caughtUp)
             [self asyncTasksFinished: 1]; // balances -asyncTaskStarted in -beginReplicating
@@ -171,10 +164,8 @@ static NSString* joinQuotedEscaped(NSArray* strings);
 - (void) retry {
     // This is called if I've gone idle but some revisions failed to be pulled.
     // I should start the _changes feed over again, so I can retry all the revisions.
-    [super retry];
-
     [_changeTracker stop];
-    [self beginReplicating];
+    [super retry];
 }
 
 
@@ -217,13 +208,12 @@ static NSString* joinQuotedEscaped(NSArray* strings);
                                 revIDs: (NSArray*)revIDs
                                deleted: (BOOL)deleted
 {
-    NSUInteger changeCount = 0;
-
     // Process each change from the feed:
     if (![CBLDatabase isValidDocumentID: docID])
         return;
     
     
+    self.changesTotal += revIDs.count;
     CBLFilterIdBlock block = [CBLManager filterIdBlock];
     
     if (block != nil) {
@@ -246,10 +236,7 @@ static NSString* joinQuotedEscaped(NSArray* strings);
             rev.conflicted = true;
         LogTo(SyncVerbose, @"%@: Received #%@ %@", self, remoteSequenceID, rev);
         [self addToInbox: rev];
-
-        changeCount++;
     }
-    self.changesTotal += changeCount;
 }
 
 
@@ -274,6 +261,7 @@ static NSString* joinQuotedEscaped(NSArray* strings);
     NSError* error = tracker.error;
     LogTo(Sync, @"%@: ChangeTracker stopped; error=%@", self, error.description);
     
+    BOOL continous = _changeTracker.continuous;
     _changeTracker = nil;
     
     if (error) {
@@ -284,7 +272,7 @@ static NSString* joinQuotedEscaped(NSArray* strings);
     }
     
     [_batcher flushAll];
-    if (!_continuous)
+    if (!continous)
         [self asyncTasksFinished: 1]; // balances -asyncTaskStarted in -startChangeTracker
     if (!_caughtUp)
         [self asyncTasksFinished: 1]; // balances -asyncTaskStarted in -beginReplicating
@@ -296,23 +284,24 @@ static NSString* joinQuotedEscaped(NSArray* strings);
 
 // Process a bunch of remote revisions from the _changes feed at once
 - (void) processInbox: (CBL_RevisionList*)inbox {
-    if (!_canBulkGet) {
-        _canBulkGet = [_serverType hasPrefix: @"Couchbase Sync Gateway/"]
-                   && [_serverType compare: @"Couchbase Sync Gateway/0.81"] >= 0;
-    }
+    if (!_canBulkGet)
+        _canBulkGet = [self serverIsSyncGatewayVersion: @"0.81"];
 
     // Ask the local database which of the revs are not known to it:
     LogTo(SyncVerbose, @"%@: Looking up %@", self, inbox);
     id lastInboxSequence = [inbox.allRevisions.lastObject remoteSequenceID];
-    NSUInteger total = self.changesTotal - inbox.count;
+    NSUInteger originalCount = inbox.count;
     if (![_db findMissingRevisions: inbox]) {
         Warn(@"%@ failed to look up local revs", self);
         inbox = nil;
     }
-    if (self.changesTotal != total + inbox.count)
-        self.changesTotal = total + inbox.count;
+    NSUInteger missingCount = inbox.count;
+    if (missingCount < originalCount) {
+        // Some of the revisions originally in the inbox aren't missing; treat those as processed:
+        self.changesProcessed += originalCount - missingCount;
+    }
     
-    if (inbox.count == 0) {
+    if (missingCount == 0) {
         // Nothing to do; just count all the revisions as processed.
         // Instead of adding and immediately removing the revs to _pendingSequences,
         // just do the latest one (equivalent but faster):
@@ -407,7 +396,7 @@ static NSString* joinQuotedEscaped(NSArray* strings);
     // See: http://wiki.apache.org/couchdb/HTTP_Document_API#GET
     // See: http://wiki.apache.org/couchdb/HTTP_Document_API#Getting_Attachments_With_a_Document
     NSString* path = $sprintf(@"%@?rev=%@&revs=true&attachments=true",
-                              CBLEscapeID(rev.docID), CBLEscapeID(rev.revID));
+                              CBLEscapeURLParam(rev.docID), CBLEscapeURLParam(rev.revID));
     // If the document has attachments, add an 'atts_since' param with a list of
     // already-known revisions, so the server can skip sending the bodies of any
     // attachments we already have locally:
@@ -423,25 +412,21 @@ static NSString* joinQuotedEscaped(NSArray* strings);
     // Under ARC, using variable dl directly in the block given as an argument to initWithURL:...
     // results in compiler error (could be undefined variable)
     __weak CBL_Puller *weakSelf = self;
-    CBLMultipartDownloader *dl;
+    __block CBLMultipartDownloader *dl;
     dl = [[CBLMultipartDownloader alloc] initWithURL: CBLAppendToURL(_remote, path)
                                            database: db
                                      requestHeaders: self.requestHeaders
                                        onCompletion:
-        ^(CBLMultipartDownloader* dl, NSError *error) {
+        ^(CBLMultipartDownloader* result, NSError *error) {
             __strong CBL_Puller *strongSelf = weakSelf;
             // OK, now we've got the response revision:
             if (error) {
-                strongSelf.error = error;
-                [strongSelf revisionFailed];
-                strongSelf.changesProcessed++;
+                [strongSelf revision: rev failedWithError: error];
             } else {
-                CBL_Revision* gotRev = [CBL_Revision revisionWithProperties: dl.document];
+                CBL_Revision* gotRev = [CBL_Revision revisionWithProperties: result.document];
                 gotRev.sequence = rev.sequence;
                 // Add to batcher ... eventually it will be fed to -insertRevisions:.
-                [strongSelf asyncTaskStarted];
-                [gotRev.body compact];
-                [_downloadsToInsert queueObject: gotRev];
+                [strongSelf queueDownloadedRevision:gotRev];
             }
             
             // Note that we've finished this task:
@@ -453,8 +438,6 @@ static NSString* joinQuotedEscaped(NSArray* strings);
         }
      ];
     [self addRemoteRequest: dl];
-    dl.timeoutInterval = self.requestTimeout;
-    dl.authorizer = _authorizer;
     [dl start];
 }
 
@@ -489,7 +472,7 @@ static NSString* joinQuotedEscaped(NSArray* strings);
     [self asyncTaskStarted];
     ++_httpConnectionCount;
     __weak CBL_Puller *weakSelf = self;
-    CBLBulkDownloader *dl;
+    __block CBLBulkDownloader *dl;
     dl = [[CBLBulkDownloader alloc] initWithDbURL: _remote
                                          database: _db
                                    requestHeaders: self.requestHeaders
@@ -500,50 +483,54 @@ static NSString* joinQuotedEscaped(NSArray* strings);
               __strong CBL_Puller *strongSelf = weakSelf;
               // Find the matching revision in 'remainingRevs' and get its sequence:
               CBL_Revision* rev;
-              if (props[@"_id"])
+              if (props.cbl_id)
                   rev = [CBL_Revision revisionWithProperties: props];
               else
                   rev = [[CBL_Revision alloc] initWithDocID: props[@"id"]
                                                       revID: props[@"rev"] deleted: NO];
               NSUInteger pos = [remainingRevs indexOfObject: rev];
-              if (pos != NSNotFound) {
-                  rev.sequence = [remainingRevs[pos] sequence];
-                  [remainingRevs removeObjectAtIndex: pos];
-              } else {
-                  Warn(@"%@: Received unexpected rev %@", self, rev);
+              if (pos == NSNotFound) {
+                  Warn(@"%@: Received unexpected rev %@; ignoring", self, rev);
+                  return;
               }
+              rev.sequence = [remainingRevs[pos] sequence];
+              [remainingRevs removeObjectAtIndex: pos];
 
-              if (props[@"_id"]) {
+              if (props.cbl_id) {
                   // Add to batcher ... eventually it will be fed to -insertRevisions:.
-                  [strongSelf asyncTaskStarted];
-                  [rev.body compact];
-                  [strongSelf->_downloadsToInsert queueObject: rev];
+                  [strongSelf queueDownloadedRevision:rev];
               } else {
                   CBLStatus status = CBLStatusFromBulkDocsResponseItem(props);
-                  strongSelf.error = CBLStatusToNSError(status, nil);
-                  [strongSelf revisionFailed];
-                  strongSelf.changesProcessed++;
+                  [strongSelf revision: rev failedWithError: CBLStatusToNSError(status, nil)];
               }
           }
                                    onCompletion:
-          ^(CBLMultipartDownloader* dl, NSError *error) {
+          ^(CBLBulkDownloader* result, NSError *error) {
               // The entire _bulk_get is finished:
               __strong CBL_Puller *strongSelf = weakSelf;
               if (error) {
                   strongSelf.error = error;
                   [strongSelf revisionFailed];
-                  strongSelf.changesProcessed += remainingRevs.count;
+              } else if (remainingRevs.count > 0) {
+                  Warn(@"%@: %u revs not returned from _bulk_get: %@",
+                       self, (unsigned)remainingRevs.count, remainingRevs);
               }
+              strongSelf.changesProcessed += remainingRevs.count;
+              
               // Note that we've finished this task:
-              [self asyncTasksFinished: 1];
+              [strongSelf removeRemoteRequest:dl];
+              [strongSelf asyncTasksFinished:1];
+              
               --_httpConnectionCount;
               // Start another task if there are still revisions waiting to be pulled:
               [strongSelf pullRemoteRevisions];
           }
      ];
     [self addRemoteRequest: dl];
-    dl.timeoutInterval = self.requestTimeout;
-    dl.authorizer = _authorizer;
+
+    if (self.canSendCompressedRequests)
+        [dl compressBody];
+
     [dl start];
 }
 
@@ -620,11 +607,10 @@ static NSString* joinQuotedEscaped(NSArray* strings);
     // http://wiki.apache.org/couchdb/HTTP_Bulk_Document_API
     [self asyncTaskStarted];
     ++_httpConnectionCount;
-    NSMutableArray* remainingRevs = [bulkRevs mutableCopy];
-    NSArray* keys = [bulkRevs my_map: ^(CBL_Revision* rev) { return rev.docID; }];
+    CBL_RevisionList* remainingRevs = [[CBL_RevisionList alloc] initWithArray: bulkRevs];
     [self sendAsyncRequest: @"POST"
                       path: @"_all_docs?include_docs=true"
-                      body: $dict({@"keys", keys})
+                      body: $dict({@"keys", remainingRevs.allDocIDs})
               onCompletion:^(id result, NSError *error) {
                   if (error) {
                       self.error = error;
@@ -639,29 +625,36 @@ static NSString* joinQuotedEscaped(NSArray* strings);
                             self, (unsigned)rows.count);
                       for (NSDictionary* row in rows) {
                           NSDictionary* doc = $castIf(NSDictionary, row[@"doc"]);
-                          if (doc && !doc[@"_attachments"]) {
+                          if (doc && !doc.cbl_attachments) {
                               CBL_Revision* rev = [CBL_Revision revisionWithProperties: doc];
-                              NSUInteger pos = [remainingRevs indexOfObject: rev];
-                              if (pos != NSNotFound) {
-                                  rev.sequence = [remainingRevs[pos] sequence];
-                                  [remainingRevs removeObjectAtIndex: pos];
-                                  [self asyncTaskStarted];
-                                  [rev.body compact];
-                                  [_downloadsToInsert queueObject: rev];
+                              CBL_Revision* removedRev = [remainingRevs removeAndReturnRev: rev];
+                              if (removedRev) {
+                                  rev.sequence = removedRev.sequence;
+                                  [self queueDownloadedRevision: rev];
+                              }
+                          } else {
+                              CBLStatus status = CBLStatusFromBulkDocsResponseItem(row);
+                              if (CBLStatusIsError(status) && row[@"key"]) {
+                                  CBL_Revision* rev = [remainingRevs revWithDocID: row[@"key"]];
+                                  if (rev) {
+                                      [remainingRevs removeRev: rev];
+                                      [self revision: rev
+                                            failedWithError: CBLStatusToNSError(status, nil)];
+                                  }
                               }
                           }
                       }
-                  }
 
-                  // Any leftover revisions that didn't get matched will be fetched individually:
-                  if (remainingRevs.count) {
-                      LogTo(Sync, @"%@ bulk-fetch didn't work for %u of %u revs; getting individually",
-                      self, (unsigned)remainingRevs.count, (unsigned)bulkRevs.count);
-                      for (CBL_Revision* rev in remainingRevs)
-                          [self queueRemoteRevision: rev];
-                      [self pullRemoteRevisions];
+                      // Any leftover revisions that didn't get matched will be fetched individually:
+                      if (remainingRevs.count) {
+                          LogTo(Sync, @"%@ bulk-fetch didn't work for %u of %u revs; getting individually",
+                                self, (unsigned)remainingRevs.count, (unsigned)bulkRevs.count);
+                          for (CBL_Revision* rev in remainingRevs)
+                              [self queueRemoteRevision: rev];
+                          [self pullRemoteRevisions];
+                      }
                   }
-
+                  
                   // Note that we've finished this task:
                   [self asyncTasksFinished: 1];
                   --_httpConnectionCount;
@@ -671,6 +664,51 @@ static NSString* joinQuotedEscaped(NSArray* strings);
      ];
 }
 
+- (void) revision: (CBL_Revision*)rev failedWithError: (NSError*)error {
+    if (CBLMayBeTransientError(error))
+        [self revisionFailed]; // retry later
+    else {
+        LogTo(SyncVerbose, @"Giving up on %@: %@", rev, error);
+        [_pendingSequences removeSequence: rev.sequence];
+    }
+    self.changesProcessed++;
+}
+
+// This invokes the tranformation block if one is installed and queues the resulting CBL_Revision
+- (void) queueDownloadedRevision: (CBL_Revision*)rev {
+    if (self.revisionBodyTransformationBlock) {
+        // Add 'file' properties to attachments pointing to their bodies:
+        [rev[@"_attachments"] enumerateKeysAndObjectsUsingBlock:^(NSString* name,
+                                                                  NSMutableDictionary* attachment,
+                                                                  BOOL *stop) {
+            [attachment removeObjectForKey: @"file"];
+            if (attachment[@"follows"] && !attachment[@"data"]) {
+                NSString* filePath = [[_db fileForAttachmentDict: attachment] path];
+                if (filePath)
+                    attachment[@"file"] = filePath;
+            }
+        }];
+
+        CBL_Revision* xformed = [self transformRevision: rev];
+        if (xformed == nil) {
+            LogTo(Sync, @"%@: Transformer rejected revision %@", self, rev);
+            [_pendingSequences removeSequence: rev.sequence];
+            self.lastSequence = _pendingSequences.checkpointedValue;
+            return;
+        }
+        rev = xformed;
+
+        // Clean up afterwards
+        [rev[@"_attachments"] enumerateKeysAndObjectsUsingBlock:^(NSString* name,
+                                                                  NSMutableDictionary* attachment,
+                                                                  BOOL *stop) {
+            [attachment removeObjectForKey: @"file"];
+        }];
+    }
+    [rev.body compact];
+    [self asyncTaskStarted];
+    [_downloadsToInsert queueObject: rev];
+}
 
 // This will be called when _downloadsToInsert fills up:
 - (void) insertDownloads:(NSArray *)downloads {

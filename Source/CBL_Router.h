@@ -8,7 +8,7 @@
 
 #import "CBLDatabase+Internal.h"
 #import "CBLManager+Internal.h"
-@class CBL_Server, CBLResponse, CBL_Body, CBLMultipartWriter;
+@class CBL_Server, CBLResponse, CBL_Body, CBLMultipartWriter, CBLQueryOptions;
 
 
 typedef CBLStatus (^OnAccessCheckBlock)(CBLDatabase*, NSString *docID, SEL action);
@@ -69,11 +69,11 @@ typedef void (^OnFinishedBlock)();
 - (BOOL) boolQuery: (NSString*)param;
 - (int) intQuery: (NSString*)param defaultValue: (int)defaultValue;
 - (id) jsonQuery: (NSString*)param error: (NSError**)outError;
-- (NSMutableDictionary*) jsonQueries;
+@property NSDictionary* queries;
 - (BOOL) cacheWithEtag: (NSString*)etag;
 - (CBLContentOptions) contentOptions;
-- (BOOL) getQueryOptions: (struct CBLQueryOptions*)options;
-@property (readonly) NSString* multipartRequestType;
+- (CBLQueryOptions*) getQueryOptions;
+- (BOOL) explicitlyAcceptsType: (NSString*)mimeType;
 @property (readonly) NSDictionary* bodyAsDictionary;
 @property (readonly) NSString* ifMatch;
 - (CBLStatus) openDB;

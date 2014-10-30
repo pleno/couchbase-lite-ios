@@ -18,6 +18,7 @@
 #import "CBLJSON.h"
 #import "Test.h"
 #import "MYBlockUtils.h"
+
 #import <CouchbaseLite/CouchbaseLite.h>
 
 #undef FOR_TESTING_PURPOSES
@@ -47,6 +48,31 @@ int main (int argc, const char * argv[]) {
 
 
 - (void) applicationDidFinishLaunching: (NSNotification*)n {
+    // Ensure that every public class is an exported symbol in the CouchbaseLite framework:
+    [CBLAttachment class];
+    [CBLAuthenticator class];
+    [CBLDatabase class];
+    [CBLDatabaseChange class];
+    [CBLDocument class];
+    [CBLFullTextQueryRow class];
+    [CBLGeoQueryRow class];
+    [CBLJSON class];
+    [CBLLiveQuery class];
+    [CBLManager class];
+    [CBLModel class];
+    [CBLModelFactory class];
+    [CBLQuery class];
+    [CBLQueryEnumerator class];
+    [CBLQueryRow class];
+    [CBLReplication class];
+    [CBLRevision class];
+    [CBLSavedRevision class];
+    [CBLUnsavedRevision class];
+    [CBLView class];
+    Assert(&kCBLDatabaseChangeNotification != nil);
+    Assert(&kCBLDocumentChangeNotification != nil);
+    Assert(&kCBLReplicationChangeNotification != nil);
+
     NSDictionary* bundleInfo = [[NSBundle mainBundle] infoDictionary];
     NSString* dbName = bundleInfo[@"DemoDatabase"];
     if (!dbName) {
@@ -101,11 +127,6 @@ int main (int argc, const char * argv[]) {
     }];
 
 #endif
-}
-
-
-- (IBAction) applicationWillTerminate:(id)sender {
-    [_database.manager close];
 }
 
 
@@ -237,15 +258,18 @@ int main (int argc, const char * argv[]) {
         [self stopObservingReplication: _pull];
     if (_push)
         [self stopObservingReplication: _push];
-    _pull = [_database replicationFromURL: otherDbURL];
-    _push = [_database replicationToURL: otherDbURL];
-    _pull.continuous = _push.continuous = YES;
-    [self observeReplication: _pull];
-    [self observeReplication: _push];
-    [_pull start];
-    [_push start];
-    
-    _syncHostField.stringValue = otherDbURL ? $sprintf(@"⇄ %@", otherDbURL.host) : @"";
+    if (otherDbURL) {
+        _pull = [_database createPullReplication: otherDbURL];
+        _push = [_database createPushReplication: otherDbURL];
+        _pull.continuous = _push.continuous = YES;
+        [self observeReplication: _pull];
+        [self observeReplication: _push];
+        [_pull start];
+        [_push start];
+        _syncHostField.stringValue = $sprintf(@"⇄ %@", otherDbURL.host);
+    } else {
+        _syncHostField.stringValue = @"";
+    }
 #endif
 }
 
@@ -388,12 +412,12 @@ int main (int argc, const char * argv[]) {
     NSTimeInterval changedFor = item.timeSinceExternallyChanged;
     if (changedFor > 0 && changedFor < kChangeGlowDuration) {
         float fraction = (float)(1.0 - changedFor / kChangeGlowDuration);
-        if (YES || [cell isKindOfClass: [NSButtonCell class]])
-            bg = [[NSColor controlBackgroundColor] blendedColorWithFraction: fraction 
+//        if ([cell isKindOfClass: [NSButtonCell class]])
+            bg = [[NSColor controlBackgroundColor] blendedColorWithFraction: fraction
                                                         ofColor: [NSColor yellowColor]];
-        else
-            bg = [[NSColor yellowColor] colorWithAlphaComponent: fraction];
-        
+//        else
+//            bg = [[NSColor yellowColor] colorWithAlphaComponent: fraction];
+
         if (!_glowing) {
             _glowing = YES;
             MYAfterDelay(0.1, ^{

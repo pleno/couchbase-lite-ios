@@ -48,6 +48,11 @@
 
     if (!_http) {
         NSMutableURLRequest* urlRequest = [NSMutableURLRequest requestWithURL: url];
+        if (self.usePOST) {
+            urlRequest.HTTPMethod = @"POST";
+            urlRequest.HTTPBody = self.changesFeedPOSTBody;
+            [urlRequest setValue: @"application/json" forHTTPHeaderField: @"Content-Type"];
+        }
         _http = [[WebSocketHTTPLogic alloc] initWithURLRequest: urlRequest];
         // Add headers from my .requestHeaders property:
         [self.requestHeaders enumerateKeysAndObjectsUsingBlock: ^(id key, id value, BOOL *stop) {
@@ -66,7 +71,7 @@
     }
 
     // Now open the connection:
-    LogTo(SyncVerbose, @"%@: GET %@", self, url.resourceSpecifier);
+    LogTo(SyncVerbose, @"%@: %@ %@", self, (self.usePOST ?@"POST" :@"GET"), url.resourceSpecifier);
     CFReadStreamRef cfInputStream = CFReadStreamCreateForHTTPRequest(NULL, request);
     CFRelease(request);
     if (!cfInputStream)
@@ -84,17 +89,10 @@
         Assert(ok);
     }
 
-    if (_databaseURL.my_isHTTPS) {
-        // Enable SSL for this connection.
-        // Disable TLS 1.2 support because it breaks compatibility with some SSL servers;
-        // workaround taken from Apple technote TN2287:
-        // http://developer.apple.com/library/ios/#technotes/tn2287/
-        NSDictionary *settings = $dict({(id)kCFStreamSSLLevel,
-                                        @"kCFStreamSocketSecurityLevelTLSv1_0SSLv3"});
-        CFReadStreamSetProperty(cfInputStream,
-                                kCFStreamPropertySSLSettings, (CFTypeRef)settings);
-    }
-    
+    NSDictionary* tls = self.TLSSettings;
+    if (tls)
+        CFReadStreamSetProperty(cfInputStream, kCFStreamPropertySSLSettings, (CFTypeRef)tls);
+
     _gotResponseHeaders = false;
 
     _trackingInput = (NSInputStream*)CFBridgingRelease(cfInputStream);
@@ -102,7 +100,7 @@
     [_trackingInput scheduleInRunLoop: [NSRunLoop currentRunLoop] forMode: NSRunLoopCommonModes];
     [_trackingInput open];
     _startTime = CFAbsoluteTimeGetCurrent();
-    LogTo(ChangeTracker, @"%@: Started... <%@>", self, url);
+    LogTo(ChangeTracker, @"%@: Started... <%@>", self, url.my_sanitizedString);
     return YES;
 }
 
@@ -129,24 +127,17 @@
 
 
 - (BOOL) checkSSLCert {
+    BOOL trusted = YES;
     SecTrustRef sslTrust = (SecTrustRef) CFReadStreamCopyProperty((CFReadStreamRef)_trackingInput,
                                                                   kCFStreamPropertySSLPeerTrust);
     if (sslTrust) {
         NSURL* url = CFBridgingRelease(CFReadStreamCopyProperty((CFReadStreamRef)_trackingInput,
                                                                 kCFStreamPropertyHTTPFinalURL));
-        BOOL trusted = [_client changeTrackerApproveSSLTrust: sslTrust
-                                                     forHost: url.host
-                                                        port: (UInt16)url.port.intValue];
+
+        trusted = [self checkServerTrust: sslTrust forURL: url];
         CFRelease(sslTrust);
-        if (!trusted) {
-            //TODO: This error could be made more precise
-            self.error = [NSError errorWithDomain: NSURLErrorDomain
-                                             code: NSURLErrorServerCertificateUntrusted
-                                         userInfo: nil];
-            return NO;
-        }
     }
-    return YES;
+    return trusted;
 }
 
 
@@ -243,13 +234,6 @@
 
 
 - (void) failedWithError:(NSError*) error {
-    // Map lower-level errors from CFStream to higher-level NSURLError ones:
-    if ($equal(error.domain, NSPOSIXErrorDomain)) {
-        if (error.code == ECONNREFUSED)
-            error = [NSError errorWithDomain: NSURLErrorDomain
-                                        code: NSURLErrorCannotConnectToHost
-                                    userInfo: error.userInfo];
-    }
     [self clearConnection];
     [super failedWithError: error];
 }

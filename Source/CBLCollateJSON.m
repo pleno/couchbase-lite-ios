@@ -25,14 +25,30 @@
 #endif
 
 
-static int cmp(int n1, int n2) {
-    int diff = n1 - n2;
-    return diff > 0 ? 1 : (diff < 0 ? -1 : 0);
+static inline int cmp(int n1, int n2) {
+    return (n1>n2) ? 1 : ((n1<n2)? -1 : 0);
 }
 
-static int dcmp(double n1, double n2) {
-    double diff = n1 - n2;
-    return diff > 0.0 ? 1 : (diff < 0.0 ? -1 : 0);
+static inline int dcmp(double n1, double n2) {
+    return (n1>n2) ? 1 : ((n1<n2)? -1 : 0);
+}
+
+
+// Maps an ASCII character to its relative priority in the Unicode collation sequence.
+static uint8_t kCharPriority[128];
+// Same thing but case-insensitive.
+static uint8_t kCharPriorityCaseInsensitive[128];
+
+static void initializeCharPriorityMap(void) {
+    static const char* const kInverseMap = "\t\n\r `^_-,;:!?.'\"()[]{}@*/\\&#%+<=>|~$0123456789aAbBcCdDeEfFgGhHiIjJkKlLmMnNoOpPqQrRsStTuUvVwWxXyYzZ";
+    uint8_t priority = 1;
+    for (unsigned i=0; i<strlen(kInverseMap); i++)
+        kCharPriority[(uint8_t)kInverseMap[i]] = priority++;
+
+    // This table gives lowercase letters the same priority as uppercase:
+    memcpy(kCharPriorityCaseInsensitive, kCharPriority, sizeof(kCharPriority));
+    for (uint8_t c = 'a'; c <= 'z'; c++)
+        kCharPriorityCaseInsensitive[c] = kCharPriority[toupper(c)];
 }
 
 
@@ -62,24 +78,32 @@ static SInt8 kRawOrderOfValueType[] = {
 };
 
 
+static uint8_t kTypeOf[256];
+
+static void initializeValueTypes(void) {
+    memset(&kTypeOf, kIllegal, sizeof(kTypeOf));
+    memset(&kTypeOf['0'], kNumber, 10);
+    kTypeOf['n'] = kNull;
+    kTypeOf['f'] = kFalse;
+    kTypeOf['t'] = kTrue;
+    kTypeOf['-'] = kNumber;
+    kTypeOf['"'] = kString;
+    kTypeOf[']'] = kEndArray;
+    kTypeOf['}'] = kEndObject;
+    kTypeOf[','] = kComma;
+    kTypeOf[':'] = kColon;
+    kTypeOf['['] = kArray;
+    kTypeOf['{'] = kObject;
+}
+
+
 static ValueType valueTypeOf(char c) {
-    switch (c) {
-        case 'n':           return kNull;
-        case 'f':           return kFalse;
-        case 't':           return kTrue;
-        case '0' ... '9':
-        case '-':           return kNumber;
-        case '"':           return kString;
-        case ']':           return kEndArray;
-        case '}':           return kEndObject;
-        case ',':           return kComma;
-        case ':':           return kColon;
-        case '[':           return kArray;
-        case '{':           return kObject;
-        default:
-            Warn(@"Unexpected character '%c' parsing JSON", c);
-            return kIllegal;
-    }
+    ValueType v = kTypeOf[(uint8_t)c];
+#if DEBUG
+    if (v == kIllegal)
+        Warn(@"Unexpected character '%c' parsing JSON", c);
+#endif
+    return v;
 }
 
 
@@ -93,7 +117,7 @@ static char convertEscape(const char **in) {
             int uc = (digittoint(digits[0]) << 12) | (digittoint(digits[1]) << 8) |
                      (digittoint(digits[2]) <<  4) | (digittoint(digits[3]));
             if (uc > 127)
-                Warn(@"CBLCollateJSON can't correctly compare \\u%.4s", digits);
+                return 0xFF;        // This function doesn't support non-ASCII characters
             return (char)uc;
         }
         case 'b':   return '\b';
@@ -126,13 +150,66 @@ static int compareStringsASCII(const char** in1, const char** in2) {
             c1 = convertEscape(&str1);
         ifc (c2 == '\\')
             c2 = convertEscape(&str2);
-        
+
+        if ((c1 & 0x80) || (c2 & 0x80))
+            Warn(@"CBLCollateJSON can't compare Unicode chars in ASCII collation");
+
         // Compare the next characters:
         int s = cmp(c1, c2);
         ifc (s)
             return s;
     }
     
+    // Strings are equal, so update the positions:
+    *in1 = str1 + 1;
+    *in2 = str2 + 1;
+    return 0;
+}
+
+
+// Unicode collation, but fails (returns -2) if non-ASCII characters are found.
+// Basic rule is to compare case-insensitively, but if the strings compare equal, let the one that's
+// higher case-sensitively win (where uppercase is _greater_ than lowercase, unlike in ASCII.)
+static int compareStringsUnicodeFast(const char** in1, const char** in2) {
+    TestedBy(CBLCollateScalars);
+    const char* str1 = *in1, *str2 = *in2;
+    int resultIfEqual = 0;
+    while(true) {
+        char c1 = *++str1;
+        char c2 = *++str2;
+
+        // If one string ends, the other is greater; if both end, they're equal:
+        ifc (c1 == '"') {
+            ifc (c2 == '"')
+                break;
+            else
+                return -1;
+        } else ifc (c2 == '"')
+            return 1;
+
+        // Handle escape sequences:
+        ifc (c1 == '\\')
+            c1 = convertEscape(&str1);
+        ifc (c2 == '\\')
+            c2 = convertEscape(&str2);
+
+        if ((c1 & 0x80) || (c2 & 0x80))
+            return -2; // fail: I only handle ASCII
+
+        // Compare the next characters, according to case-insensitive Unicode character priority:
+        int s = cmp(kCharPriorityCaseInsensitive[(uint8_t)c1],
+                    kCharPriorityCaseInsensitive[(uint8_t)c2]);
+        ifc (s)
+            return s;
+
+        // Remember case-sensitive result too
+        ifc (resultIfEqual == 0 && c1 != c2)
+            resultIfEqual = cmp(kCharPriority[(uint8_t)c1], kCharPriority[(uint8_t)c2]);
+    }
+
+    ifc (resultIfEqual)
+        return resultIfEqual;
+
     // Strings are equal, so update the positions:
     *in1 = str1 + 1;
     *in2 = str2 + 1;
@@ -185,10 +262,15 @@ static NSString* createStringFromJSON(const char** in) {
 
 
 static int compareStringsUnicode(const char** in1, const char** in2) {
-    NSString* str1 = createStringFromJSON(in1);
-    NSString* str2 = createStringFromJSON(in2);
-    int result = (int)[str1 localizedCompare: str2];
-    return result;
+    int result = compareStringsUnicodeFast(in1, in2);
+    if (result > -2)
+        return result;
+    // Fast compare failed, so resort to using NSString:
+    @autoreleasepool {
+        NSString* str1 = createStringFromJSON(in1);
+        NSString* str2 = createStringFromJSON(in2);
+        return (int)[str1 localizedCompare: str2];
+    }
 }
 
 
@@ -219,6 +301,13 @@ int CBLCollateJSONLimited(void *context,
                          unsigned arrayLimit)
 {
     TestedBy(CBLCollateJSON);
+
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        initializeValueTypes();
+        initializeCharPriorityMap();
+    });
+
     const char* str1 = chars1;
     const char* str2 = chars2;
     int depth = 0;
@@ -377,6 +466,8 @@ TestCase(CBLCollateScalars) {
     CAssertEq(collate(mode, "\"a\"", "\"A\""), -1);
     CAssertEq(collate(mode, "\"A\"", "\"aa\""), -1);
     CAssertEq(collate(mode, "\"B\"", "\"aa\""), 1);
+    CAssertEq(collate(mode, "\"~\"", "\"A\""), -1);
+    CAssertEq(collate(mode, "\"_\"", "\"A\""), -1);
 #endif
 }
 

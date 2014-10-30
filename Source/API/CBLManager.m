@@ -41,6 +41,31 @@
 
 static const CBLManagerOptions kCBLManagerDefaultOptions;
 
+
+#ifdef GNUSTEP
+static double CouchbaseLiteVersionNumber = 0.7;
+#else
+extern double CouchbaseLiteVersionNumber; // Defined in Xcode-generated CouchbaseLite_vers.c
+#endif
+
+
+NSString* CBLVersion( void ) {
+    if (CouchbaseLiteVersionNumber > 0)
+        return $sprintf(@"%s (build %g)", CBL_VERSION_STRING, CouchbaseLiteVersionNumber);
+    else
+        return $sprintf(@"%s (unofficial)", CBL_VERSION_STRING);
+}
+
+static NSString* CBLFullVersionInfo( void ) {
+    NSMutableString* vers = [NSMutableString stringWithFormat: @"Couchbase Lite %@", CBLVersion()];
+#ifdef CBL_SOURCE_REVISION
+    if (strlen(CBL_SOURCE_REVISION) > (0))
+        [vers appendFormat: @"; git commit %s", CBL_SOURCE_REVISION];
+#endif
+    return vers;
+}
+
+
 @interface CBLManager ()
 
 @property (nonatomic) NSMutableDictionary* customHTTPHeaders;
@@ -71,6 +96,7 @@ static NSCharacterSet* kIllegalNameChars;
 
 + (void) initialize {
     if (self == [CBLManager class]) {
+        Log(@"### %@ ###", CBLFullVersionInfo());
         kIllegalNameChars = [[NSCharacterSet characterSetWithCharactersInString: kLegalChars]
                              invertedSet];
     }
@@ -81,6 +107,10 @@ static NSCharacterSet* kIllegalNameChars;
     EnableLog(YES);
     if (type != nil)
         _EnableLogTo(type, YES);
+}
+
++ (void) redirectLogging: (void (^)(NSString* type, NSString* message))callback {
+    MYLoggingCallback = callback;
 }
 
 
@@ -203,6 +233,10 @@ static CBLManager* sInstance;
                                                 error: &error];
     Assert(dbm, @"Failed to create db manager at %@: %@", path, error);
     AssertEqual(dbm.directory, path);
+    AfterThisTest(^{
+        [dbm close];
+        [[NSFileManager defaultManager] removeItemAtPath: path error: NULL];
+    });
     return dbm;
 }
 
@@ -214,7 +248,7 @@ static CBLManager* sInstance;
 
 - (id) copyWithZone: (NSZone*)zone {
     CBLManager *managerCopy = [[[self class] alloc] initWithDirectory: self.directory
-                                           options: &_options
+                                                              options: &_options
                                                                shared: _shared];
     
     managerCopy.customHTTPHeaders = [self.customHTTPHeaders copy];
@@ -231,7 +265,7 @@ static CBLManager* sInstance;
     Assert(self != sInstance, @"Please don't close the sharedInstance!");
     LogTo(CBLDatabase, @"CLOSING %@ ...", self);
     for (CBLDatabase* db in _databases.allValues) {
-        [db close];
+        [db _close];
     }
     [_databases removeAllObjects];
     _shared = nil;
@@ -271,6 +305,37 @@ static CBLManager* sInstance;
 - (NSString*) description {
     return $sprintf(@"%@[%p %@]", [self class], self, self.directory);
 }
+
+
+- (BOOL) excludedFromBackup {
+    NSNumber* excluded;
+    NSError* error;
+    if (![[NSURL fileURLWithPath: _dir] getResourceValue: &excluded
+                                                  forKey: NSURLIsExcludedFromBackupKey
+                                                   error: &error]) {
+        Warn(@"%@: -excludedFromBackup failed: %@", self, error);
+    }
+    return excluded.boolValue;
+}
+
+- (void) setExcludedFromBackup: (BOOL)exclude {
+    NSError* error;
+    if (![[NSURL fileURLWithPath: _dir] setResourceValue: @(exclude)
+                                                  forKey: NSURLIsExcludedFromBackupKey
+                                                   error: &error]) {
+        Warn(@"%@: -setExcludedFromBackup:%d failed: %@", self, exclude, error);
+    }
+}
+
+
+#if TARGET_OS_IPHONE
+- (NSDataWritingOptions) fileProtection {
+    return _options.fileProtection & NSDataWritingFileProtectionMask;
+}
+#endif
+
+
+#pragma mark - BACKGROUND TASKS:
 
 
 - (void) doAsync: (void (^)())block {
@@ -373,13 +438,6 @@ static CBLManager* sInstance;
     return db;
 }
 
-#ifdef CBL_DEPRECATED
-- (CBLDatabase*) createDatabaseNamed: (NSString*)name error: (NSError**)outError {
-    return [self databaseNamed: name error: outError];
-}
-#endif
-
-
 #if DEBUG
 - (CBLDatabase*) createEmptyDatabaseNamed: (NSString*)name error: (NSError**)outError {
     CBLDatabase* db = _databases[name];
@@ -462,15 +520,14 @@ static CBLManager* sInstance;
 }
 
 
+// Called when a database is being closed
 - (void) _forgetDatabase: (CBLDatabase*)db {
     NSString* name = db.name;
     [_replications my_removeMatching: ^int(CBLReplication* repl) {
         return [repl localDatabase] == db;
     }];
     [_databases removeObjectForKey: name];
-    CBL_Shared* shared = _shared;
-    [shared closedDatabase: name];
-    [shared forgetDatabaseNamed: name];
+    [_shared closedDatabase: name];
 }
 
 
@@ -686,7 +743,7 @@ TestCase(CBLManager) {
     NSMutableString* longName = [@"long" mutableCopy];
     while (longName.length < 240)
         [longName appendString: @"!"];
-    for (NSString* name in @[@"", @"0", @"123foo", @"Foo", @"/etc/passwd", @"foo " @"_foo", longName])
+    for (NSString* name in @[@"", @"0", @"123foo", @"Foo", @"/etc/passwd", @"foo ", @"_foo", longName])
         CAssert(![CBLManager isValidDatabaseName: name], @"Db name '%@' should not be valid", name);
 
     CBLManager* dbm = [CBLManager createEmptyAtTemporaryPath: @"CBLManagerTest"];
@@ -703,6 +760,30 @@ TestCase(CBLManager) {
 
     CAssertEq([dbm existingDatabaseNamed: @"foo" error: NULL], db);
     [dbm close];
+}
+
+TestCase(CBLManager_Close) {
+    RequireTestCase(CBLManager);
+
+    CBLManager* mgrMain = [CBLManager createEmptyAtTemporaryPath: @"CBLManagerTest"];
+
+    CBLManager* mgr1 = [mgrMain copy];
+    CBLDatabase* db = [mgr1 databaseNamed: @"test_db" error: NULL];
+    CAssert(db);
+    
+    CBLManager* mgr2 = [mgrMain copy];
+    db = [mgr2 databaseNamed: @"test_db" error: NULL];
+    CAssert(db);
+    
+    [mgr1 close];
+    NSInteger count = [mgrMain.shared countForOpenedDatabase: @"test_db"];
+    CAssertEq(count, 1);
+    
+    [mgr2 close];
+    count = [mgrMain.shared countForOpenedDatabase: @"test_db"];
+    CAssertEq(count, 0);
+    
+    [mgrMain close];
 }
 
 #endif

@@ -25,7 +25,7 @@
 #import "CBLInternal.h"
 #import "CBLMisc.h"
 #import "CBLBase64.h"
-#import "CBLCanonicalJSON.h"
+#import "CBJSONEncoder.h"
 #import "MYBlockUtils.h"
 #import "MYURLUtils.h"
 
@@ -68,6 +68,7 @@ NSString* CBL_ReplicatorStoppedNotification = @"CBL_ReplicatorStopped";
     unsigned _revisionsFailed;
     NSError* _error;
     NSThread* _thread;
+    NSString* _remoteCheckpointDocID;
     NSDictionary* _remoteCheckpoint;
     BOOL _savingCheckpoint, _overdueForSave;
     NSMutableArray* _remoteRequests;
@@ -77,6 +78,8 @@ NSString* CBL_ReplicatorStoppedNotification = @"CBL_ReplicatorStopped";
     CBLReachability* _host;
     BOOL _suspended;
 }
+
+@synthesize revisionBodyTransformationBlock=_revisionBodyTransformationBlock;
 
 + (NSString *)progressChangedNotification
 {
@@ -196,7 +199,7 @@ NSString* CBL_ReplicatorStoppedNotification = @"CBL_ReplicatorStopped";
     NSNotification* n = [NSNotification notificationWithName: CBL_ReplicatorProgressChangedNotification
                                                       object: self];
     [[NSNotificationQueue defaultQueue] enqueueNotification: n
-                                               postingStyle: NSPostWhenIdle
+                                               postingStyle: NSPostASAP
                                                coalesceMask: NSNotificationCoalescingOnSender |
                                                              NSNotificationCoalescingOnName
                                                    forModes: nil];
@@ -255,6 +258,8 @@ NSString* CBL_ReplicatorStoppedNotification = @"CBL_ReplicatorStopped";
             LogTo(Sync, @"%@ Progress: %lu / %lu",
                   self, (unsigned long)processed, (unsigned long)_changesTotal);
     }
+    if ((NSInteger)processed < 0)
+        Warn(@"Suspicious changesProcessed value: %llu", (UInt64)processed);
     _changesProcessed = processed;
     [self postProgressChanged];
 }
@@ -264,6 +269,8 @@ NSString* CBL_ReplicatorStoppedNotification = @"CBL_ReplicatorStopped";
         LogTo(Sync, @"%@ Progress: %lu / %lu",
               self, (unsigned long)_changesProcessed, (unsigned long)total);
     }
+    if ((NSInteger)total < 0)
+        Warn(@"Suspicious changesTotal value: %llu", (UInt64)total);
     _changesTotal = total;
     [self postProgressChanged];
 }
@@ -276,7 +283,10 @@ NSString* CBL_ReplicatorStoppedNotification = @"CBL_ReplicatorStopped";
     {
         LogTo(Sync, @"%@ Progress: set error = %@", self, error.localizedDescription);
         _error = error;
-        [self postProgressChanged];
+        if (CBLIsPermanentError(error))
+            [self stop];
+        else
+            [self postProgressChanged];
     }
 }
 
@@ -368,7 +378,6 @@ NSString* CBL_ReplicatorStoppedNotification = @"CBL_ReplicatorStopped";
     [self endBackgrounding];
 #endif
     self.running = NO;
-    self.changesProcessed = self.changesTotal = 0;
     [[NSNotificationCenter defaultCenter]
         postNotificationName: CBL_ReplicatorStoppedNotification object: self];
     [self saveLastSequence];
@@ -377,14 +386,16 @@ NSString* CBL_ReplicatorStoppedNotification = @"CBL_ReplicatorStopped";
     [_host stop];
     _host = nil;
     _suspended = NO;
+    self.revisionBodyTransformationBlock = nil;
     [self clearDbRef];  // _db no longer tracks me so it won't notify me when it closes; clear ref now
 }
 
 
 // Called after a continuous replication has gone idle, but it failed to transfer some revisions
-// and so wants to try again in a minute. Should be overridden by subclasses.
+// and so wants to try again in a minute. Can be overridden by subclasses.
 - (void) retry {
     self.error = nil;
+    [self checkSession];
 }
 
 - (void) retryIfReady {
@@ -455,6 +466,10 @@ NSString* CBL_ReplicatorStoppedNotification = @"CBL_ReplicatorStopped";
         [self goOnline];
     else if (host.reachabilityKnown || _suspended)
         [self goOffline];
+}
+
+- (BOOL) suspended {
+    return _suspended;
 }
 
 // When suspended, the replicator acts as though it's offline, stopping all network activity.
@@ -534,6 +549,38 @@ NSString* CBL_ReplicatorStoppedNotification = @"CBL_ReplicatorStopped";
 }
 
 
+- (CBL_Revision *) transformRevision:(CBL_Revision *)rev {
+    if(_revisionBodyTransformationBlock) {
+        @try {
+            CBL_Revision* xformed = _revisionBodyTransformationBlock(rev);
+            if (xformed == nil)
+                return nil;
+            if (xformed != rev) {
+                AssertEqual(xformed.docID, rev.docID);
+                AssertEqual(xformed.revID, rev.revID);
+                AssertEqual(xformed[@"_revisions"], rev[@"_revisions"]);
+                if (xformed[@"_attachments"]) {
+                    // Insert 'revpos' properties into any attachments added by the callback:
+                    CBL_MutableRevision* mx = xformed.mutableCopy;
+                    xformed = mx;
+                    [mx mutateAttachments: ^NSDictionary *(NSString *name, NSDictionary *info) {
+                        if (info[@"revpos"])
+                            return info;
+                        Assert(info[@"data"], @"Transformer added attachment without adding data");
+                        NSMutableDictionary* nuInfo = info.mutableCopy;
+                        nuInfo[@"revpos"] = @(rev.generation);
+                        return nuInfo;
+                    }];
+                }
+                rev = xformed;
+            }
+        }@catch (NSException* x) {
+            Warn(@"%@: Exception transforming a revision of doc '%@': %@", self, rev.docID, x);
+        }
+    }
+    return rev;
+}
+
 // Before doing anything else, determine whether we have an active login session.
 - (void) checkSession {
     if (![_authorizer respondsToSelector: @selector(loginParametersForSite:)]) {
@@ -560,7 +607,7 @@ NSString* CBL_ReplicatorStoppedNotification = @"CBL_ReplicatorStopped";
                       LogTo(Sync, @"%@: Session check failed: %@", self, error);
                       self.error = error;
                   } else {
-                      NSString* username = $castIf(NSString, [[result objectForKey: @"userCtx"] objectForKey: @"name"]);
+                      NSString* username = $castIf(NSString, result[@"userCtx"][@"name"]);
                       if (username) {
                           LogTo(Sync, @"%@: Active session, logged in as '%@'", self, username);
                           [self fetchRemoteCheckpointDoc];
@@ -615,6 +662,17 @@ NSString* CBL_ReplicatorStoppedNotification = @"CBL_ReplicatorStopped";
 }
 
 
+- (BOOL) serverIsSyncGatewayVersion: (NSString*)minVersion {
+    return [_serverType hasPrefix: @"Couchbase Sync Gateway/"]
+        && [[_serverType substringFromIndex: 23] compare: minVersion] >= 0;
+}
+
+
+- (BOOL) canSendCompressedRequests {
+    return [self serverIsSyncGatewayVersion: @"0.92"];
+}
+
+
 - (CBLRemoteJSONRequest*) sendAsyncRequest: (NSString*)method
                                      path: (NSString*)path
                                      body: (id)body
@@ -646,9 +704,10 @@ NSString* CBL_ReplicatorStoppedNotification = @"CBL_ReplicatorStopped";
         }
         onCompletion(result, error);
     }];
-    req.delegate = self;
-    req.timeoutInterval = self.requestTimeout;
-    req.authorizer = _authorizer;
+
+    if (self.canSendCompressedRequests)
+        [req compressBody];
+
     [self addRemoteRequest: req];
     [req start];
     return req;
@@ -656,6 +715,10 @@ NSString* CBL_ReplicatorStoppedNotification = @"CBL_ReplicatorStopped";
 
 
 - (void) addRemoteRequest: (CBLRemoteRequest*)request {
+    request.delegate = self;
+    request.timeoutInterval = self.requestTimeout;
+    request.authorizer = _authorizer;
+
     if (!_remoteRequests)
         _remoteRequests = [[NSMutableArray alloc] init];
     [_remoteRequests addObject: request];
@@ -732,17 +795,23 @@ static BOOL sOnlyTrustAnchorCerts;
     It's based on the local database UUID (the private one, to make the result unguessable),
     the remote database's URL, and the filter name and parameters (if any). */
 - (NSString*) remoteCheckpointDocID {
-    // Needs to be consistent with -hasSameSettingsAs: --
-    // If a.remoteCheckpointID == b.remoteCheckpointID then [a hasSameSettingsAs: b]
-    NSMutableDictionary* spec = $mdict({@"localUUID", _db.privateUUID},
-                                       {@"remoteURL", _remote.absoluteString},
-                                       {@"push", @(self.isPush)},
-                                       {@"continuous", (self.continuous ? nil : $false)},
-                                       {@"filter", _filterName},
-                                       {@"filterParams", _filterParameters},
-                                     //{@"headers", _requestHeaders}, (removed; see #143)
-                                       {@"docids", _docIDs});
-    return CBLHexSHA1Digest([CBLCanonicalJSON canonicalData: spec]);
+    if (!_remoteCheckpointDocID) {
+        // Needs to be consistent with -hasSameSettingsAs: --
+        // If a.remoteCheckpointID == b.remoteCheckpointID then [a hasSameSettingsAs: b]
+        NSMutableDictionary* spec = $mdict({@"localUUID", _db.privateUUID},
+                                           {@"remoteURL", _remote.absoluteString},
+                                           {@"push", @(self.isPush)},
+                                           {@"continuous", (self.continuous ? nil : $false)},
+                                           {@"filter", _filterName},
+                                           {@"filterParams", _filterParameters},
+                                         //{@"headers", _requestHeaders}, (removed; see #143)
+                                           {@"docids", _docIDs});
+        NSError *error;
+        _remoteCheckpointDocID = CBLHexSHA1Digest([CBJSONEncoder canonicalEncoding: spec
+                                                                             error: &error]);
+        Assert(!error);
+    }
+    return _remoteCheckpointDocID;
 }
 
 
@@ -830,53 +899,58 @@ static BOOL sOnlyTrustAnchorCerts;
         return;
     }
     _lastSequenceChanged = _overdueForSave = NO;
-    
-    LogTo(Sync, @"%@ checkpointing sequence=%@", self, _lastSequence);
+
+    id lastSequence = _lastSequence;
+    LogTo(Sync, @"%@ checkpointing sequence=%@", self, lastSequence);
     NSMutableDictionary* body = [_remoteCheckpoint mutableCopy];
     if (!body)
         body = $mdict();
-    [body setValue: _lastSequence.description forKey: @"lastSequence"]; // always save as a string
+    [body setValue: [lastSequence description] forKey: @"lastSequence"]; // always save as a string
     
     _savingCheckpoint = YES;
     NSString* checkpointID = self.remoteCheckpointDocID;
-    [self sendAsyncRequest: @"PUT"
-                      path: [@"_local/" stringByAppendingString: checkpointID]
-                      body: body
-              onCompletion: ^(id response, NSError* error) {
-                  _savingCheckpoint = NO;
-                  if (error)
-                      Warn(@"%@: Unable to save remote checkpoint: %@", self, error);
-                  CBLDatabase* db = _db;
-                  if (!db)
-                      return;
-                  if (error) {
-                      // Failed to save checkpoint:
-                      Warn(@"%@: Unable to save remote checkpoint: %@", self, error);
-                      switch(CBLStatusFromNSError(error, 0)) {
-                          case kCBLStatusNotFound:
-                              self.remoteCheckpoint = nil; // doc deleted or db reset
-                              _overdueForSave = YES; // try saving again
-                              break;
-                          case kCBLStatusConflict:
-                              [self refreshRemoteCheckpointDoc];
-                              break;
-                          default:
-                              break;
-                              // TODO: On 401 or 403, and this is a pull, remember that remote
-                              // is read-only & don't attempt to read its checkpoint next time.
+    CBLRemoteRequest* request =
+        [self sendAsyncRequest: @"PUT"
+                          path: [@"_local/" stringByAppendingString: checkpointID]
+                          body: body
+                  onCompletion: ^(id response, NSError* error) {
+                      _savingCheckpoint = NO;
+                      if (error)
+                          Warn(@"%@: Unable to save remote checkpoint: %@", self, error);
+                      CBLDatabase* db = _db;
+                      if (!db)
+                          return;
+                      if (error) {
+                          // Failed to save checkpoint:
+                          switch(CBLStatusFromNSError(error, 0)) {
+                              case kCBLStatusNotFound:
+                                  self.remoteCheckpoint = nil; // doc deleted or db reset
+                                  _overdueForSave = YES; // try saving again
+                                  break;
+                              case kCBLStatusConflict:
+                                  [self refreshRemoteCheckpointDoc];
+                                  break;
+                              default:
+                                  break;
+                                  // TODO: On 401 or 403, and this is a pull, remember that remote
+                                  // is read-only & don't attempt to read its checkpoint next time.
+                          }
+                      } else {
+                          // Saved checkpoint:
+                          id rev = response[@"rev"];
+                          if (rev)
+                              body[@"_rev"] = rev;
+                          self.remoteCheckpoint = body;
+                          [db setLastSequence: lastSequence withCheckpointID: checkpointID];
+                          LogTo(Sync, @"%@ saved remote checkpoint '%@' (_rev=%@)",
+                                self, lastSequence, rev);
                       }
-                  } else {
-                      // Saved checkpoint:
-                      id rev = response[@"rev"];
-                      if (rev)
-                          body[@"_rev"] = rev;
-                      self.remoteCheckpoint = body;
-                      [db setLastSequence: _lastSequence withCheckpointID: checkpointID];
+                      if (_overdueForSave)
+                          [self saveLastSequence];      // start a save that was waiting on me
                   }
-                  if (_overdueForSave)
-                      [self saveLastSequence];      // start a save that was waiting on me
-              }
-     ];
+         ];
+    // This request should not be canceled when the replication is told to stop:
+    [_remoteRequests removeObject: request];
 }
 
 

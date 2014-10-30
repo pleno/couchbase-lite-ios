@@ -9,9 +9,17 @@
 #import <Foundation/Foundation.h>
 #import "CBL_Revision.h"
 
-NSString* CBLVersionString( void );
+
+// In a method/function implementation (not declaration), declaring an object parameter as
+// __unsafe_unretained avoids the implicit retain at the start of the function and releasse at
+// the end. In a performance-sensitive function, those can be significant overhead. Of course this
+// should never be used if the object might be released during the function.
+#define UU __unsafe_unretained
+
 
 extern NSString* const CBLHTTPErrorDomain;
+
+BOOL CBLWithStringBytes(NSString* str, void (^block)(const char*, size_t));
 
 NSString* CBLCreateUUID( void );
 
@@ -29,9 +37,8 @@ NSString* CBLHexFromBytes( const void* bytes, size_t length) __attribute__((nonn
 
 NSComparisonResult CBLSequenceCompare( SequenceNumber a, SequenceNumber b);
 
-/** Escapes a document or revision ID for use in a URL.
-    This does the usual %-escaping, but makes sure that '/' is escaped in case the ID appears in the path portion of the URL, and that '&' is escaped in case the ID appears in a query value. */
-NSString* CBLEscapeID( NSString* param ) __attribute__((nonnull));
+/** Convenience function to JSON-encode an object to a string. */
+NSString* CBLJSONString( id object );
 
 /** Escapes a string to be used as the value of a query parameter in a URL.
     This does the usual %-escaping, but makes sure that '&' is also escaped. */
@@ -46,6 +53,11 @@ NSString* CBLUnquoteString( NSString* param );
 
 /** Abbreviates a string to 10 characters or less by replacing its middle with "..". */
 NSString* CBLAbbreviate( NSString* str );
+
+/** Parses a string to an integer. Returns YES on success, NO on failure.
+    Fails on strings that start numeric but contain junk afterwards, like "123*foo".
+    You may pass NULL for outInt if you don't care about the numeric value. */
+BOOL CBLParseInteger(NSString* str, NSInteger* outInt);
 
 /** Returns YES if this error appears to be due to the computer being offline or the remote host being unreachable. */
 BOOL CBLIsOfflineError( NSError* error );
@@ -69,3 +81,9 @@ NSURL* CBLURLWithoutQuery( NSURL* url ) __attribute__((nonnull));
 
 /** Appends path components to a URL. These will NOT be URL-escaped, so you can include queries. */
 NSURL* CBLAppendToURL(NSURL* baseURL, NSString* toAppend) __attribute__((nonnull));
+
+
+#if DEBUG
+NSString* CBLPathToTestFile(NSString* name);
+NSData* CBLContentsOfTestFile(NSString* name);
+#endif

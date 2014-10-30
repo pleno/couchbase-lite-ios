@@ -19,7 +19,6 @@
 #import "CBLView+Internal.h"
 #import "CBL_Body.h"
 #import "CBLMultipartWriter.h"
-#import "CBLInternal.h"
 #import "CBLJSON.h"
 #import "CBLMisc.h"
 #import "CBLGeometry.h"
@@ -137,18 +136,6 @@
     return result;
 }
 
-- (NSMutableDictionary*) jsonQueries {
-    NSMutableDictionary* queries = $mdict();
-    [self.queries enumerateKeysAndObjectsUsingBlock: ^(NSString* param, NSString* value, BOOL *stop) {
-        id parsed = [CBLJSON JSONObjectWithData: [value dataUsingEncoding: NSUTF8StringEncoding]
-                                       options: CBLJSONReadingAllowFragments
-                                         error: nil];
-        if (parsed)
-            queries[param] = parsed;
-    }];
-    return queries;
-}
-
 
 - (BOOL) cacheWithEtag: (NSString*)etag {
     NSString* eTag = $sprintf(@"\"%@\"", etag);
@@ -190,9 +177,9 @@
 }
 
 
-- (BOOL) getQueryOptions: (CBLQueryOptions*)options {
+- (CBLQueryOptions*) getQueryOptions {
     // http://wiki.apache.org/couchdb/HTTP_view_API#Querying_Options
-    *options = kDefaultCBLQueryOptions;
+    CBLQueryOptions* options = [CBLQueryOptions new];
     options->skip = [self intQuery: @"skip" defaultValue: options->skip];
     options->limit = [self intQuery: @"limit" defaultValue: options->limit];
     options->groupLevel = [self intQuery: @"group_level" defaultValue: options->groupLevel];
@@ -207,6 +194,10 @@
     options->updateSeq = [self boolQuery: @"update_seq"];
     if ([self query: @"inclusive_end"])
         options->inclusiveEnd = [self boolQuery: @"inclusive_end"];
+    if ([self query: @"inclusive_start"])
+        options->inclusiveStart = [self boolQuery: @"inclusive_start"]; // nonstandard
+    options->prefixMatchLevel = [self intQuery: @"prefix_match_level" // nonstandard
+                                  defaultValue: options->prefixMatchLevel];
     options->reduceSpecified = [self query: @"reduce"] != nil;
     options->reduce =  [self boolQuery: @"reduce"];
     options->group = [self boolQuery: @"group"];
@@ -216,29 +207,35 @@
     NSError* error = nil;
     id keys = [self jsonQuery: @"keys" error: &error];
     if (error || (keys && ![keys isKindOfClass: [NSArray class]]))
-        return NO;
+        return nil;
     if (!keys) {
         id key = [self jsonQuery: @"key" error: &error];
         if (error)
-            return NO;
+            return nil;
         if (key)
             keys = @[key];
     }
     
     if (keys) {
-        options->keys = [self retainQuery: keys];
+        options.keys = [self retainQuery: keys];
     } else {
         // Handle 'startkey' and 'endkey':
-        options->startKey = [self retainQuery: [self jsonQuery: @"startkey" error: &error]];
+        options.startKey = [self retainQuery: [self jsonQuery: @"startkey" error: &error]];
         if (error)
-            return NO;
-        options->endKey = [self retainQuery: [self jsonQuery: @"endkey" error: &error]];
+            return nil;
+        options.endKey = [self retainQuery: [self jsonQuery: @"endkey" error: &error]];
         if (error)
-            return NO;
+            return nil;
+        options.startKeyDocID = [self retainQuery: [self jsonQuery: @"startkey_docid" error: &error]];
+        if (error)
+            return nil;
+        options.endKeyDocID = [self retainQuery: [self jsonQuery: @"endkey_docid" error: &error]];
+        if (error)
+            return nil;
     }
 
     // Nonstandard full-text search options 'full_text', 'snippets', 'ranking':
-    options->fullTextQuery = [self retainQuery: [self query: @"full_text"]];
+    options.fullTextQuery = [self retainQuery: [self query: @"full_text"]];
     options->fullTextSnippets = [self boolQuery: @"snippets"];
     if ([self query: @"ranking"])
         options->fullTextRanking = [self boolQuery: @"ranking"];
@@ -248,21 +245,19 @@
     if (bboxString) {
         CBLGeoRect bbox;
         if (!CBLGeoCoordsStringToRect(bboxString, &bbox))
-            return NO;
+            return nil;
         NSData* savedBbox = [NSData dataWithBytes: &bbox length: sizeof(bbox)];
         [_queryRetainer addObject: savedBbox];
         options->bbox = savedBbox.bytes;
     }
 
-    return YES;
+    return options;
 }
 
 
-- (NSString*) multipartRequestType {
+- (BOOL) explicitlyAcceptsType: (NSString*)mimeType {
     NSString* accept = [_request valueForHTTPHeaderField: @"Accept"];
-    if ([accept hasPrefix: @"multipart/"])
-        return accept;
-    return nil;
+    return accept && [accept rangeOfString: mimeType].length > 0;
 }
 
 
@@ -422,13 +417,14 @@ static NSArray* splitPath( NSURL* url ) {
             return status;
         }
     }
-    
-#ifdef GNUSTEP
-    IMP fn = objc_msg_lookup(self, sel);
-    return (CBLStatus) fn(self, sel, _db, docID, attachmentName);
-#else
-    return (CBLStatus) objc_msgSend(self, sel, _db, docID, attachmentName);
-#endif
+
+    // Send 'sel' to self, i.e. call the method it names. This is equivalent to -performSelector,
+    // which isn't legal under ARC.
+    // The parameters are the database, doc ID and attachment name; any of these can be missing in
+    // the actual method since C allows unhandled parameters.
+    IMP imp = [self methodForSelector: sel];
+    CBLStatus (*methodImpl)(id, SEL, CBLDatabase*, NSString*, NSString*) = (void *)imp;
+    return methodImpl(self, sel, _db, docID, attachmentName);
 }
 
 
@@ -557,7 +553,7 @@ static NSArray* splitPath( NSURL* url ) {
         return;
     _responseSent = YES;
 
-    _response[@"Server"] = $sprintf(@"CouchbaseLite %@", CBLVersionString());
+    _response[@"Server"] = $sprintf(@"CouchbaseLite %@", CBLVersion());
 
     // Check for a mismatch between the Accept request header and the response type:
     NSString* accept = [_request valueForHTTPHeaderField: @"Accept"];
@@ -570,21 +566,23 @@ static NSArray* splitPath( NSURL* url ) {
             _response.internalStatus = kCBLStatusNotAcceptable;
         }
     }
-
-    if (_response.body.isValidJSON)
+    
+    // When response body is not nil and there is no content-type given,
+    // set default value to 'application/json'.
+    if (_response.body && !_response[@"Content-Type"]) {
         _response[@"Content-Type"] = @"application/json";
-
+    }
+    
     if (_response.status == 200 && ($equal(_request.HTTPMethod, @"GET") ||
                                     $equal(_request.HTTPMethod, @"HEAD"))) {
         if (!_response[@"Cache-Control"])
             _response[@"Cache-Control"] = @"must-revalidate";
     }
 
-    for (NSString *key in [_server.customHTTPHeaders allKeys])
-    {
+    for (NSString *key in [_server.customHTTPHeaders allKeys]) {
         _response[key] = _server.customHTTPHeaders[key];
     }
-
+    
     if (_onResponseReady)
         _onResponseReady(_response);
 }
@@ -646,7 +644,7 @@ static NSArray* splitPath( NSURL* url ) {
 
 
 - (CBLStatus) do_UNKNOWN {
-    return kCBLStatusBadRequest;
+    return kCBLStatusNotFound;
 }
 
 

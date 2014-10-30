@@ -24,6 +24,11 @@
 #import "CBLJSON.h"
 
 
+@interface CBL_Router ()
+- (instancetype) initWithDatabaseManager: (CBLManager*)dbManager request: (NSURLRequest*)request;
+@end
+
+
 #if DEBUG
 #pragma mark - UTILITIES
 
@@ -83,7 +88,7 @@ static CBLResponse* sLastResponse;
 
 static id SendBody(CBLManager* server, NSString* method, NSString* path, id bodyObj,
                    CBLStatus expectedStatus, id expectedResult) {
-    sLastResponse = SendRequest(server, method, path, nil, bodyObj);
+    sLastResponse = SendRequest(server, method, path, @{@"Accept": @"application/json"}, bodyObj);
     id result = ParseJSONResponse(sLastResponse);
     Log(@"%@ %@ --> %d", method, path, sLastResponse.status);
     CAssert(result != nil);
@@ -115,16 +120,18 @@ TestCase(CBL_Router_Server) {
     RequireTestCase(CBLManager);
     CBLManager* server = createDBManager();
     Send(server, @"GET", @"/", kCBLStatusOK, $dict({@"CouchbaseLite", @"Welcome"},
-                                          {@"couchdb", @"Welcome"},
-                                          {@"version", CBLVersionString()}));
+                                                   {@"couchdb", @"Welcome"},
+                                                   {@"version", CBLVersion()},
+                                                   {@"vendor", @{@"name": @"Couchbase Lite (Objective-C)",
+                                                                 @"version": CBLVersion()}}));
     Send(server, @"GET", @"/_all_dbs", kCBLStatusOK, @[]);
     Send(server, @"GET", @"/non-existent", kCBLStatusNotFound, nil);
     Send(server, @"GET", @"/BadName", kCBLStatusBadID, nil);
-    Send(server, @"PUT", @"/", kCBLStatusBadRequest, nil);
-    NSDictionary* response = Send(server, @"POST", @"/", kCBLStatusBadRequest, nil);
+    Send(server, @"PUT", @"/", kCBLStatusNotFound, nil);
+    NSDictionary* response = Send(server, @"POST", @"/", kCBLStatusNotFound, nil);
     
-    CAssertEqual(response[@"status"], @(400));
-    CAssertEqual(response[@"error"], @"bad_request");
+    CAssertEqual(response[@"status"], @(404));
+    CAssertEqual(response[@"error"], @"not_found");
     
     NSDictionary* session = Send(server, @"GET", @"/_session", kCBLStatusOK, nil);
     CAssert(session[@"ok"]);
@@ -136,8 +143,6 @@ TestCase(CBL_Router_Server) {
     NSDictionary* asserted = SendBody(server, @"POST", @"/_persona_assertion", $dict({@"assertion", sampleAssertion}), kCBLStatusOK, nil);
     CAssert(asserted[@"ok"]);
     CAssertEqual(asserted[@"email"], @"jens@mooseyard.com");
-
-    [server close];
 }
 
 
@@ -162,7 +167,6 @@ TestCase(CBL_Router_Databases) {
     Send(server, @"PUT", @"/database%2Fwith%2Fslashes", kCBLStatusCreated, nil);
     dbInfo = Send(server, @"GET", @"/database%2Fwith%2Fslashes", kCBLStatusOK, nil);
     CAssertEqual(dbInfo[@"db_name"], @"database/with/slashes");
-    [server close];
 }
 
 
@@ -223,7 +227,6 @@ TestCase(CBL_Router_Docs) {
     RequireTestCase(CBL_Router_Databases);
     CBLManager* server = createDBManager();
     populateDocs(server);
-    [server close];
 }
 
 
@@ -249,7 +252,6 @@ TestCase(CBL_Router_LocalDocs) {
     Send(server, @"GET", @"/db/_changes", kCBLStatusOK,
          $dict({@"last_seq", @0},
                {@"results", @[]}));
-    [server close];
 }
 
 
@@ -297,7 +299,6 @@ TestCase(CBL_Router_AllDocs) {
                                     {@"doc", $dict({@"message", @"bonjour"},
                                                    {@"_id", @"doc3"}, {@"_rev", revID3} )})
                               ));
-    [server close];
 }
 
 
@@ -348,7 +349,7 @@ TestCase(CBL_Router_Views) {
     Send(server, @"GET", @"/db/_design/design/_view/view?key=%22bonjour%22", kCBLStatusOK,
          $dict({@"offset", @0},
                {@"rows", $array($dict({@"id", @"doc3"}, {@"key", @"bonjour"}) )},
-               {@"total_rows", @1}));
+               {@"total_rows", @4}));
 
     // Query the view with "?keys="
     Send(server, @"GET", @"/db/_design/design/_view/view?keys=%5B%22bonjour%22,%22hello%22%5D",
@@ -356,9 +357,7 @@ TestCase(CBL_Router_Views) {
          $dict({@"offset", @0},
                {@"rows", $array($dict({@"id", @"doc3"}, {@"key", @"bonjour"}),
                                 $dict({@"id", @"doc1"}, {@"key", @"hello"}) )},
-               {@"total_rows", @2}));
-    
-    [server close];
+               {@"total_rows", @4}));
 }
 
 
@@ -395,7 +394,6 @@ TestCase(CBL_Router_Changes) {
     Send(server, @"GET", @"/db/_changes?since=5", kCBLStatusOK,
          $dict({@"last_seq", @5},
                {@"results", @[]}));
-    [server close];
 }
 
 
@@ -441,7 +439,6 @@ TestCase(CBL_Router_LongPollChanges) {
                                                           {@"changes", $array($dict({@"rev", revID6}))},
                                                           {@"seq", @6}))}));
     [router stop];
-    [server close];
 }
 
 
@@ -489,7 +486,6 @@ TestCase(CBL_Router_ContinuousChanges) {
     CAssert(!finished);
     
     [router stop];
-    [server close];
 }
 
 
@@ -546,6 +542,10 @@ TestCase(CBL_Router_GetAttachment) {
     
     // Get the document with attachment data:
     response = SendRequest(server, @"GET", @"/db/doc1?attachments=true", nil, nil);
+    CAssert([response.headers[@"Content-Type"] hasPrefix: @"multipart/related;"]);
+
+    response = SendRequest(server, @"GET", @"/db/doc1?attachments=true",
+                           @{@"Accept": @"application/json"}, nil);
     CAssertEq(response.status, kCBLStatusOK);
     CAssertEqual((response.body)[@"_attachments"],
                  $dict({@"attach", $dict({@"data", [CBLBase64 encode: attach1]}, 
@@ -586,9 +586,45 @@ TestCase(CBL_Router_GetAttachment) {
                                                                      {@"length", @(attach2.length)},
                                                                      {@"digest", @"sha1-IrXQo0jpePvuKPv5nswnenqsIMc="},
                                                                      {@"revpos", @1})})}));
-    [server close];
 }
 
+TestCase(CBL_Router_GetJSONAttachment) {
+    CBLManager* server = createDBManager();
+    
+    // Create a document with two json-like attachements. One with be put as 'text/plain' and
+    // the other one will be put as 'application/json'.
+    Send(server, @"PUT", @"/db", kCBLStatusCreated, nil);
+    
+    NSData* attach1 = [@"{\"name\": \"foo\"}" dataUsingEncoding: NSUTF8StringEncoding];
+    NSData* attach2 = [@"{\"name\": \"bar\"}" dataUsingEncoding: NSUTF8StringEncoding];
+    
+    NSString* base641 = [CBLBase64 encode: attach1];
+    NSString* base642 = [CBLBase64 encode: attach2];
+    
+    NSDictionary* attachmentDict = $dict({@"attach1", $dict({@"content_type", @"text/plain"},
+                                                            {@"data", base641})},
+                                         {@"attach2", $dict({@"content_type", @"application/json"},
+                                                            {@"data", base642})});
+    NSDictionary* props = $dict({@"message", @"hello"}, {@"_attachments", attachmentDict});
+    
+    SendBody(server, @"PUT", @"/db/doc1", props, kCBLStatusCreated, nil);
+    
+    // Get the first attachment
+    CBLResponse* response = SendRequest(server, @"GET", @"/db/doc1/attach1", nil, nil);
+    CAssertEq(response.status, kCBLStatusOK);
+    CAssertEqual(response.body.asJSON, attach1);
+    CAssertEqual((response.headers)[@"Content-Type"], @"text/plain");
+    NSString* eTag = (response.headers)[@"Etag"];
+    CAssert(eTag.length > 0);
+    
+    // Get the second attachment
+    response = SendRequest(server, @"GET", @"/db/doc1/attach2", nil, nil);
+    CAssertEq(response.status, kCBLStatusOK);
+    CAssertEqual(response.body.asJSON, attach2);
+    CAssertEqual((response.headers)[@"Content-Type"], @"application/json");
+    eTag = (response.headers)[@"Etag"];
+    CAssert(eTag.length > 0);
+}
 
 TestCase(CBL_Router_GetRange) {
     CBLManager* server = createDBManager();
@@ -617,7 +653,14 @@ TestCase(CBL_Router_GetRange) {
     CAssertEq(response.status, 206);
     CAssertEqual((response.headers)[@"Content-Range"], @"bytes 20-26/27");
     CAssertEqual(response.body.asJSON, [@"attach1" dataUsingEncoding: NSUTF8StringEncoding]);
-    [server close];
+
+    NSString* eTag = (response.headers)[@"Etag"];
+    Assert(eTag.length > 0);
+    response = SendRequest(server, @"GET", @"/db/doc1/attach",
+                           $dict({@"Range", @"bytes=-7"},
+                                 {@"If-None-Match", eTag}),
+                           nil);
+    CAssertEq(response.status, 304);
 }
 
 
@@ -649,7 +692,6 @@ TestCase(CBL_Router_PutMultipart) {
                            $dict({@"Content-Type", @"multipart/related; boundary=\"BOUNDARY\""}),
                                        [body dataUsingEncoding: NSUTF8StringEncoding]);
     CAssertEq(response.status, kCBLStatusCreated);
-    [server close];
 }
 
 
@@ -683,13 +725,17 @@ TestCase(CBL_Router_OpenRevs) {
                                     {@"_rev", revID2},
                                     {@"message", @"goodbye"})})
                 ));
-    Send(server, @"GET", $sprintf(@"/db/doc1?open_revs=[%%22%@%%22,%%22%@%%22]", revID1, @"bogus"), kCBLStatusOK,
+    NSString* uri = $sprintf(@"/db/doc1?open_revs=[%%22%@%%22,%%22%@%%22]", revID1, @"bogus");
+    Send(server, @"GET", uri, kCBLStatusOK,
          $array($dict({@"ok", $dict({@"_id", @"doc1"},
                                     {@"_rev", revID1},
                                     {@"message", @"hello"})}),
                 $dict({@"missing", @"bogus"})
                 ));
-    [server close];
+
+    // We've been forcing JSON, but verify that open_revs defaults to multipart:
+    CBLResponse* response = SendRequest(server, @"GET", uri, nil, nil);
+    CAssert([response.headers[@"Content-Type"] hasPrefix: @"multipart/mixed;"]);
 }
 
 
@@ -757,8 +803,6 @@ TestCase(CBL_Router_RevsDiff) {
                 @"ids": @[ [doc1r3ID substringFromIndex: 2], [doc1r2ID substringFromIndex: 2],
                            [doc1r1ID substringFromIndex: 2] ]
          } } );
-
-    [server close];
 }
 
 
@@ -794,7 +838,6 @@ TestCase(CBL_Router_AccessCheck) {
     
     CAssert(calledOnAccessCheck);
     CAssert(router.response.status == 401);
-    [server close];
 }
 
 
@@ -806,6 +849,7 @@ TestCase(CBL_Router) {
     RequireTestCase(CBL_Router_LongPollChanges);
     RequireTestCase(CBL_Router_ContinuousChanges);
     RequireTestCase(CBL_Router_GetAttachment);
+    RequireTestCase(CBL_Router_GetJSONAttachment);
     RequireTestCase(CBL_Router_RevsDiff);
     RequireTestCase(CBL_Router_AccessCheck);
 }

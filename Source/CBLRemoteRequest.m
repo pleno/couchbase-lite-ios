@@ -16,14 +16,15 @@
 #import "CBLRemoteRequest.h"
 #import "CBLAuthorizer.h"
 #import "CBLMisc.h"
+#import "CBLStatus.h"
 #import "CBL_BlobStore.h"
 #import "CBLDatabase.h"
-#import "CBL_Router.h"
 #import "CBL_Replicator.h"
 #import "CollectionUtils.h"
 #import "Logging.h"
 #import "Test.h"
 #import "MYURLUtils.h"
+#import "GTMNSData+zlib.h"
 
 
 // Max number of retry attempts for a transient failure, and the backoff time formula
@@ -38,7 +39,17 @@
 
 
 + (NSString*) userAgentHeader {
-    return $sprintf(@"CouchbaseLite/%@", CBLVersionString());
+    static NSString* sUserAgent;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+#if TARGET_OS_IPHONE
+        const char* platform = "iOS";
+#else
+        const char* platform = "Mac OS X";
+#endif
+        sUserAgent = $sprintf(@"CouchbaseLite/%s (%s)", CBL_VERSION_STRING, platform);
+    });
+    return sUserAgent;
 }
 
 
@@ -92,6 +103,19 @@
 
 - (void) setupRequest: (NSMutableURLRequest*)request withBody: (id)body {
     // subclasses can override this.
+}
+
+
+- (BOOL) compressBody {
+    NSData* body = _request.HTTPBody;
+    if (body.length < 100 || [_request valueForHTTPHeaderField: @"Content-Encoding"] != nil)
+        return NO;
+    NSData* encoded = [NSData gtm_dataByGzippingData: body];
+    if (encoded.length >= body.length)
+        return NO;
+    _request.HTTPBody = encoded;
+    [_request setValue: @"gzip" forHTTPHeaderField: @"Content-Encoding"];
+    return YES;
 }
 
 
@@ -164,6 +188,8 @@
 
 
 - (void) cancelWithStatus: (int)status {
+    if (!_connection)
+        return;
     [_connection cancel];
     [self connection: _connection didFailWithError: CBLStatusToNSError(status, _request.URL)];
 }
@@ -206,7 +232,7 @@
 #pragma mark - NSURLCONNECTION DELEGATE:
 
 
-static void WarnUntrustedCert(NSString* host, SecTrustRef trust) {
+void CBLWarnUntrustedCert(NSString* host, SecTrustRef trust) {
     Warn(@"CouchbaseLite: SSL server <%@> not trusted; cert chain follows:", host);
 #if TARGET_OS_IPHONE
     for (CFIndex i = 0; i < SecTrustGetCertificateCount(trust); ++i) {
@@ -274,9 +300,9 @@ static void WarnUntrustedCert(NSString* host, SecTrustRef trust) {
             [sender useCredential: [NSURLCredential credentialForTrust: trust]
                     forAuthenticationChallenge: challenge];
         } else {
-            WarnUntrustedCert(space.host, trust);
-            LogTo(RemoteRequest, @"    challenge: cancel");
-            [sender cancelAuthenticationChallenge: challenge];
+            CBLWarnUntrustedCert(space.host, trust);
+            LogTo(RemoteRequest, @"    challenge: fail (untrusted cert)");
+            [sender continueWithoutCredentialForAuthenticationChallenge: challenge];
         }
     } else {
         LogTo(RemoteRequest, @"    challenge: performDefaultHandling");

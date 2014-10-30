@@ -19,7 +19,7 @@
 #import "CouchbaseLitePrivate.h"
 #import "CBLDocument.h"
 #import "CBL_Revision.h"
-#import "CBLCanonicalJSON.h"
+#import "CBJSONEncoder.h"
 #import "CBL_Attachment.h"
 #import "CBLDatabaseChange.h"
 #import "CBL_Shared.h"
@@ -120,10 +120,15 @@
     }
     
     MD5_Update(&ctx, json.bytes, json.length);
-        
     MD5_Final(digestBytes, &ctx);
-    NSString* digest = CBLHexFromBytes(digestBytes, sizeof(digestBytes));
-    return [NSString stringWithFormat: @"%u-%@", generation+1, digest];
+
+    char hex[11 + 2*MD5_DIGEST_LENGTH + 1];
+    char *dst = hex + sprintf(hex, "%u-", generation+1);
+    for( size_t i=0; i<MD5_DIGEST_LENGTH; i+=1 )
+        dst += sprintf(dst,"%02x", digestBytes[i]); // important: generates lowercase!
+    return [[NSString alloc] initWithBytes: hex
+                                    length: dst - hex
+                                  encoding: NSASCIIStringEncoding];
 }
 
 
@@ -189,7 +194,7 @@
     // Create canonical JSON -- this is important, because the JSON data returned here will be used
     // to create the new revision ID, and we need to guarantee that equivalent revision bodies
     // result in equal revision IDs.
-    NSData* json = [CBLCanonicalJSON canonicalData: properties];
+    NSData* json = [CBJSONEncoder canonicalEncoding: properties error: nil];
     return json;
 }
 
@@ -313,9 +318,12 @@
 
             if ([self.shared hasValuesOfType: @"validation" inDatabaseNamed: _name]) {
                 // Fetch the previous revision and validate the new one against it:
+                CBL_Revision* fakeNewRev = [oldRev mutableCopyWithDocID: oldRev.docID revID: nil];
                 CBL_Revision* prevRev = [[CBL_Revision alloc] initWithDocID: docID revID: prevRevID
                                                                   deleted: NO];
-                CBLStatus status = [self validateRevision: oldRev previousRevision: prevRev];
+                CBLStatus status = [self validateRevision: fakeNewRev
+                                         previousRevision: prevRev
+                                              parentRevID: prevRevID];
                 if (CBLStatusIsError(status))
                     return status;
             }
@@ -329,7 +337,9 @@
             }
             
             // Validate:
-            CBLStatus status = [self validateRevision: oldRev previousRevision: nil];
+            CBLStatus status = [self validateRevision: oldRev
+                                     previousRevision: nil
+                                          parentRevID: nil];
             if (CBLStatusIsError(status))
                 return status;
 
@@ -404,7 +414,7 @@
                                           docNumericID: docNumericID
                                         parentSequence: parentSequence
                                                current: YES
-                                        hasAttachments: (oldRev[@"_attachments"] != nil)
+                                        hasAttachments: (oldRev.attachments != nil)
                                                   JSON: json];
         if (!sequence) {
             // The insert failed. If it was due to a constraint violation, that means a revision
@@ -458,6 +468,7 @@
                    source: (NSURL*)source
 {
     CBL_MutableRevision* rev = inRev.mutableCopy;
+    rev.sequence = 0;
     NSString* docID = rev.docID;
     NSString* revID = rev.revID;
     if (![CBLDatabase isValidDocumentID: docID] || !revID)
@@ -496,7 +507,10 @@
                 if (oldRev)
                     break;
             }
-            CBLStatus status = [self validateRevision: rev previousRevision: oldRev];
+            NSString* parentRevID = (history.count > 1) ? history[1] : nil;
+            CBLStatus status = [self validateRevision: rev
+                                     previousRevision: oldRev
+                                          parentRevID: parentRevID];
             if (CBLStatusIsError(status))
                 return status;
         }
@@ -513,7 +527,6 @@
         // in the local history:
         SequenceNumber sequence = 0;
         SequenceNumber localParentSequence = 0;
-        NSString* localParentRevID = nil;
         for (NSInteger i = historyCount - 1; i>=0; --i) {
             NSString* revID = history[i];
             CBL_Revision* localRev = [localRevs revWithDocID: docID revID: revID];
@@ -522,17 +535,9 @@
                 sequence = localRev.sequence;
                 Assert(sequence > 0);
                 localParentSequence = sequence;
-                localParentRevID = revID;
-                
+
             } else {
                 // This revision isn't known, so add it:
-
-                if (sequence == localParentSequence) {
-                    // This is the point where we branch off of the existing rev tree.
-                    // If the branch wasn't from the single existing leaf, this creates a conflict.
-                    inConflict = inConflict || (!rev.deleted && !$equal(localParentRevID, revID));
-                }
-
                 CBL_MutableRevision* newRev;
                 NSData* json = nil;
                 BOOL current = NO;
@@ -554,7 +559,7 @@
                                    docNumericID: docNumericID
                                  parentSequence: sequence
                                         current: current 
-                                 hasAttachments: (newRev[@"_attachments"] != nil)
+                                 hasAttachments: (newRev.attachments != nil)
                                            JSON: json];
                 if (sequence <= 0)
                     return self.lastDbError;
@@ -581,9 +586,11 @@
 
         // Mark the latest local rev as no longer current:
         if (localParentSequence > 0) {
-            if (![_fmdb executeUpdate: @"UPDATE revs SET current=0 WHERE sequence=?",
+            if (![_fmdb executeUpdate: @"UPDATE revs SET current=0 WHERE sequence=? AND current!=0",
                   @(localParentSequence)])
                 return self.lastDbError;
+            if (_fmdb.changes == 0)
+                inConflict = YES; // local parent wasn't a leaf, ergo we just created a branch
         }
 
         // Figure out what the new winning rev ID is:
@@ -742,6 +749,7 @@
     if (maxDepth == 0)
         maxDepth = self.maxRevTreeDepth;
 
+    Log(@"CBLDatabase: Pruning revisions to max depth %ld...", (unsigned long)maxDepth);
     *outPruned = 0;
     // First find which docs need pruning, and by how much:
     NSMutableDictionary* toPrune = $mdict();
@@ -776,11 +784,15 @@
 #pragma mark - VALIDATION:
 
 
-- (CBLStatus) validateRevision: (CBL_Revision*)newRev previousRevision: (CBL_Revision*)oldRev {
+- (CBLStatus) validateRevision: (CBL_Revision*)newRev
+              previousRevision: (CBL_Revision*)oldRev
+                   parentRevID: (NSString*)parentRevID
+{
     NSDictionary* validations = [self.shared valuesOfType: @"validation" inDatabaseNamed: _name];
     if (validations.count == 0)
         return kCBLStatusOK;
     CBLSavedRevision* publicRev = [[CBLSavedRevision alloc] initWithDatabase: self revision: newRev];
+    [publicRev _setParentRevisionID: parentRevID];
     CBLValidationContext* context = [[CBLValidationContext alloc] initWithDatabase: self
                                                                         revision: oldRev
                                                                      newRevision: newRev];
@@ -889,30 +901,5 @@
     return YES;
 }
 
-#ifdef CBL_DEPRECATED
-- (BOOL) enumerateChanges: (CBLChangeEnumeratorBlock)enumerator {
-    return [self validateChanges: enumerator];
-}
-
-- (BOOL) allowChangesOnlyTo: (NSArray*)keys {
-    for (NSString* key in self.changedKeys) {
-        if (![keys containsObject: key]) {
-            [self rejectWithMessage: $sprintf(@"The '%@' property may not be changed", key)];
-            return NO;
-        }
-    }
-    return YES;
-}
-
-- (BOOL) disallowChangesTo: (NSArray*)keys {
-    for (NSString* key in self.changedKeys) {
-        if ([keys containsObject: key]) {
-            [self rejectWithMessage: $sprintf(@"The '%@' property may not be changed", key)];
-            return NO;
-        }
-    }
-    return YES;
-}
-#endif
 
 @end

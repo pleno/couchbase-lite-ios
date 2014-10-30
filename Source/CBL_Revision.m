@@ -47,9 +47,10 @@
 
 - (instancetype) initWithBody: (CBL_Body*)body {
     Assert(body);
-    self = [self initWithDocID: body[@"_id"]
-                         revID: body[@"_rev"]
-                       deleted: body[@"_deleted"] == $true];
+    NSDictionary* props = body.properties;
+    self = [self initWithDocID: props.cbl_id
+                         revID: props.cbl_rev
+                       deleted: props.cbl_deleted];
     if (self) {
         _body = body;
     }
@@ -134,6 +135,10 @@
     return [_body objectForKeyedSubscript: key];
 }
 
+- (NSDictionary*) attachments {
+    return self.properties.cbl_attachments;
+}
+
 - (NSData*) asJSON {
     return _body.asJSON;
 }
@@ -156,7 +161,7 @@
 }
 
 - (CBL_MutableRevision*) mutableCopyWithDocID: (NSString*)docID revID: (NSString*)revID {
-    Assert(docID && revID);
+    Assert(docID);
     Assert(!_docID || $equal(_docID, docID));
     CBL_MutableRevision* rev = [[CBL_MutableRevision alloc] initWithDocID: docID revID: revID
                                                                   deleted: _deleted];
@@ -212,6 +217,40 @@
     return rev;
 }
 
+// Calls the block on every attachment dictionary. The block can return a different dictionary,
+// which will be replaced in the rev's properties. If it returns nil, the operation aborts.
+// Returns YES if any changes were made.
+- (BOOL) mutateAttachments: (NSDictionary*(^)(NSString*, NSDictionary*))block
+{
+    NSDictionary* properties = self.properties;
+    NSMutableDictionary* editedProperties = nil;
+    NSDictionary* attachments = (id)properties.cbl_attachments;
+    NSMutableDictionary* editedAttachments = nil;
+    for (NSString* name in attachments) {
+        @autoreleasepool {
+            NSDictionary* attachment = attachments[name];
+            NSDictionary* editedAttachment = block(name, attachment);
+            if (!editedAttachment) {
+                return NO;  // block canceled
+            }
+            if (editedAttachment != attachment) {
+                if (!editedProperties) {
+                    // Make the document properties and _attachments dictionary mutable:
+                    editedProperties = [properties mutableCopy];
+                    editedAttachments = [attachments mutableCopy];
+                    editedProperties[@"_attachments"] = editedAttachments;
+                }
+                editedAttachments[name] = editedAttachment;
+            }
+        }
+    }
+    if (editedProperties) {
+        self.properties = editedProperties;
+        return YES;
+    }
+    return NO;
+}
+
 @end
 
 
@@ -260,6 +299,23 @@
 
 - (void) removeRev: (CBL_Revision*)rev {
     [_revs removeObject: rev];
+}
+
+- (CBL_Revision*) removeAndReturnRev: (CBL_Revision*)rev {
+    NSUInteger index = [_revs indexOfObject: rev];
+    if (index == NSNotFound)
+        return nil;
+    rev = _revs[index];
+    [_revs removeObjectAtIndex: index];
+    return rev;
+}
+
+- (CBL_Revision*) revWithDocID: (NSString*)docID {
+    for (CBL_Revision* rev in _revs) {
+        if ($equal(rev.docID, docID))
+            return rev;
+    }
+    return nil;
 }
 
 - (CBL_Revision*) revWithDocID: (NSString*)docID revID: (NSString*)revID {

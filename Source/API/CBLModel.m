@@ -16,6 +16,7 @@
 #import "CBLModel_Internal.h"
 #import "CBLModelFactory.h"
 #import "CBLModelArray.h"
+#import "CBLDatabase+Attachments.h"
 #import "CouchbaseLitePrivate.h"
 #import "CBLMisc.h"
 #import "CBLBase64.h"
@@ -26,6 +27,7 @@
 
 @implementation CBLModel
 
+@dynamic type;
 
 - (instancetype) init {
     return [self initWithDocument: nil];
@@ -109,12 +111,6 @@
 }
 
 
-- (void) detachFromDocument {
-    _document.modelObject = nil;
-    _document = nil;
-}
-
-
 - (NSString*) idForNewDocumentInDatabase: (CBLDatabase*)db {
     return nil;  // subclasses can override this to customize the doc ID
 }
@@ -133,7 +129,6 @@
         LogTo(CBLModel, @"%@ made new document", self);
     } else {
         [self deleteDocument: nil];
-        [self detachFromDocument];  // detach immediately w/o waiting for success
     }
 }
 
@@ -143,12 +138,25 @@
     if (!rev)
         return YES;
     LogTo(CBLModel, @"%@ Deleting document", self);
+    [self willSave: nil];
+    NSDictionary* properties = self.propertiesToSaveForDeletion;
+    if (!properties) {
+        properties = @{@"_deleted": $true};
+    } else if (!properties.cbl_deleted) {
+        NSMutableDictionary* nuProps = properties.mutableCopy;
+        nuProps[@"_deleted"] = $true;
+        properties = nuProps;
+    }
     self.needsSave = NO;        // prevent any pending saves
-    rev = [rev deleteDocument: outError];
-    if (!rev)
+
+    if (![rev createRevisionWithProperties: properties error: outError])
         return NO;
-    [self detachFromDocument];
     return YES;
+}
+
+
+- (NSDictionary*) propertiesToSaveForDeletion {
+    return @{@"_deleted": $true, @"_rev": _document.currentRevision.revisionID};
 }
 
 
@@ -167,21 +175,34 @@
     _isNew = false;
     [self markExternallyChanged];
     
-    // Send KVO notifications about all my properties in case they changed:
+    // Prepare to send KVO notifications about all my properties in case they changed:
     NSSet* keys = [[self class] propertyNames];
     for (NSString* key in keys)
         [self willChangeValueForKey: key];
-    
-    // Remove unchanged cached values in _properties:
-    if (_changedNames && _properties) {
-        NSMutableSet* removeKeys = [NSMutableSet setWithArray: [_properties allKeys]];
-        [removeKeys minusSet: _changedNames];
-        [_properties removeObjectsForKeys: removeKeys.allObjects];
-    } else {
+
+    if (doc.isDeleted) {
+        // If doc was deleted, revert any unsaved changes and mark doc as unchanged:
         _properties = nil;
+        _changedNames = nil;
+        _changedAttachments = nil;
+        self.needsSave = NO;
+        // Detach from document:
+        _document.modelObject = nil;
+        _document = nil;
+
+    } else {
+        // Otherwise, remove unchanged cached values in _properties:
+        if (_changedNames && _properties) {
+            NSMutableSet* removeKeys = [NSMutableSet setWithArray: [_properties allKeys]];
+            [removeKeys minusSet: _changedNames];
+            [_properties removeObjectsForKeys: removeKeys.allObjects];
+        } else {
+            _properties = nil;
+        }
+        [self didLoadFromDocument];
     }
-    
-    [self didLoadFromDocument];
+
+    // Send KVO notifications about all my properties:
     for (NSString* key in keys)
         [self didChangeValueForKey: key];
 }
@@ -193,6 +214,25 @@
 
 - (void) markExternallyChanged {
     _changedTime = CFAbsoluteTimeGetCurrent();
+}
+
+
+- (void) revertChanges {
+    if (!_needsSave)
+        return;
+
+    // Send KVO notifications about all changed properties:
+    NSArray* changedKeys = _changedNames.allObjects;
+    for (NSString* key in changedKeys)
+        [self willChangeValueForKey: key];
+
+    [_properties removeObjectsForKeys: changedKeys];
+    _changedNames = nil;
+    _changedAttachments = nil;
+    self.needsSave = NO;
+
+    for (NSString* key in changedKeys)
+        [self didChangeValueForKey: key];
 }
 
 
@@ -257,7 +297,6 @@
     if (!_needsSave || (!_changedNames && !_changedAttachments))
         return;
     _isNew = NO;
-    _properties = nil;
     _changedNames = nil;
     _changedAttachments = nil;
     self.needsSave = NO;
@@ -350,6 +389,8 @@
         value = [CBLJSON JSONObjectWithDate: value];
     else if ([value isKindOfClass: [NSDecimalNumber class]])
         value = [value stringValue];
+    else if ([value isKindOfClass: [NSURL class]])
+        value = [value absoluteString];
     else if ([value isKindOfClass: [CBLModel class]])
         value = ((CBLModel*)value).document.documentID;
     else if ([value isKindOfClass: [NSArray class]]) {
@@ -367,7 +408,8 @@
 - (NSDictionary*) propertiesToSave {
     NSMutableDictionary* properties = [_document.properties mutableCopy];
     if (!properties)
-        properties = [[NSMutableDictionary alloc] init];
+        properties = [NSMutableDictionary dictionaryWithObject: _document.documentID
+                                                        forKey: @"_id"];
     for (NSString* key in _changedNames) {
         id value = _properties[key];
         [properties setValue: [self externalizePropertyValue: value] forKey: key];
@@ -389,10 +431,30 @@
 }
 
 
+- (void) markPropertyNeedsSave: (NSString*)property {
+    if (_properties[property] != nil && ![_changedNames containsObject: property]) {
+        if (!_changedNames)
+            _changedNames = [[NSMutableSet alloc] init];
+        [_changedNames addObject: property];
+        [self markNeedsSave];
+    }
+}
+
+
 - (id) getValueOfProperty: (NSString*)property {
     id value = _properties[property];
     if (!value && !_isNew && ![_changedNames containsObject: property]) {
         value = [_document propertyForKey: property];
+    }
+    return value;
+}
+
+- (id) getValueOfProperty: (NSString*)property ofClass: (Class)klass {
+    id value = _properties[property];
+    if (!value && !_isNew && ![_changedNames containsObject: property]) {
+        value = [_document propertyForKey: property];
+        if (![value isKindOfClass: klass])
+            value = nil;
     }
     return value;
 }
@@ -486,16 +548,20 @@
             withContentType: (NSString*)mimeType
                     content: (NSData*)content
 {
-    [self _addAttachment: [[CBLAttachment alloc] _initWithContentType: mimeType body: content]
-                  named: name];
+    CBLAttachment* attachment = nil;
+    if (content)
+        attachment = [[CBLAttachment alloc] _initWithContentType: mimeType body: content];
+    [self _addAttachment: attachment named: name];
 }
 
 - (void) setAttachmentNamed: (NSString*)name
             withContentType: (NSString*)mimeType
                  contentURL: (NSURL*)fileURL
 {
-    [self _addAttachment: [[CBLAttachment alloc] _initWithContentType: mimeType body: fileURL]
-                   named: name];
+    CBLAttachment* attachment = nil;
+    if (fileURL)
+        attachment = [[CBLAttachment alloc] _initWithContentType: mimeType body: fileURL];
+    [self _addAttachment: attachment named: name];
 }
 
 
@@ -509,21 +575,14 @@
 }
 
 - (void) removeAttachmentNamed: (NSString*)name {
-    [self addAttachment: nil named: name];
+    if (_changedAttachments[name] || _document.currentRevision.attachmentMetadata[name]) {
+        [self _addAttachment: nil named: name];
+    }
 }
-
-#ifdef CBL_DEPRECATED
-- (void) addAttachment: (CBLAttachment*)attachment named: (NSString*)name {
-    Assert(!attachment.name, @"Attachment already attached to another revision");
-    if (attachment == [self attachmentNamed: name])
-        return;
-    [self _addAttachment: attachment named: name];
-}
-#endif
 
 
 - (NSDictionary*) attachmentDataToSave {
-    NSDictionary* attachments = (_document.properties)[@"_attachments"];
+    NSDictionary* attachments = (_document.properties).cbl_attachments;
     if (!_changedAttachments)
         return attachments;
     
@@ -538,7 +597,7 @@
         else
             [nuAttach removeObjectForKey: name];
     }
-    return nuAttach;
+    return nuAttach.count ? nuAttach : nil;
 }
 
 

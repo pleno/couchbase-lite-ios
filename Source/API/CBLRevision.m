@@ -14,6 +14,7 @@
 //  and limitations under the License.
 
 #import "CouchbaseLitePrivate.h"
+#import "CBLDatabase+Attachments.h"
 #import "CBLDatabase+Insertion.h"
 #import "CBL_Revision.h"
 #import "CBLStatus.h"
@@ -64,22 +65,12 @@
 }
 
 
-static inline BOOL isTruthy(id value) {
-    return value != nil && value != $false;
-}
-
 - (BOOL) isDeletion {
-    return isTruthy(self.properties[@"_deleted"]);
+    return self.properties.cbl_deleted;
 }
-
-#ifdef CBL_DEPRECATED
-- (BOOL) isDeleted {
-    return self.isDeletion;
-}
-#endif
 
 - (BOOL) isGone {
-    return isTruthy(self.properties[@"_deleted"]) || isTruthy(self.properties[@"_removed"]);
+    return self.properties.cbl_deleted || $castIf(NSNumber, self.properties[@"_removed"]).boolValue;
 }
 
 
@@ -93,12 +84,16 @@ static inline BOOL isTruthy(id value) {
 
 
 - (NSDictionary*) attachmentMetadata {
-    return $castIf(NSDictionary, (self.properties)[@"_attachments"]);
+    return $castIf(NSDictionary, (self.properties).cbl_attachments);
 }
 
 
 - (NSDictionary*) attachmentMetadataFor: (NSString*)name {
-    return $castIf(NSDictionary, (self.attachmentMetadata)[name]);
+    id attachment = self.attachmentMetadata[name];
+    if ([attachment isKindOfClass: [CBLAttachment class]])
+        return [(CBLAttachment*)attachment metadata];
+    else
+        return $castIf(NSDictionary, attachment);
 }
 
 
@@ -108,10 +103,14 @@ static inline BOOL isTruthy(id value) {
 
 
 - (CBLAttachment*) attachmentNamed: (NSString*)name {
-    NSDictionary* metadata = [self attachmentMetadataFor: name];
-    if (!metadata)
+    id attachment = self.attachmentMetadata[name];
+    if ([attachment isKindOfClass: [CBLAttachment class]])
+        return attachment;
+    else if ([attachment isKindOfClass: [NSDictionary class]]) {
+        return [[CBLAttachment alloc] initWithRevision: self name: name metadata: attachment];
+    } else {
         return nil;
-    return [[CBLAttachment alloc] initWithRevision: self name: name metadata: metadata];
+    }
 }
 
 
@@ -131,6 +130,7 @@ static inline BOOL isTruthy(id value) {
 {
     CBL_Revision* _rev;
     BOOL _checkedProperties;
+    NSString* _parentRevID;   // Used only during validation, when parent may not be in DB
 }
 
 
@@ -167,12 +167,18 @@ static inline BOOL isTruthy(id value) {
 
 
 - (NSString*) parentRevisionID  {
-    return [_document.database getParentRevision: _rev].revID;
+    return _parentRevID ?: [_document.database getParentRevision: _rev].revID;
 }
 
 - (CBLSavedRevision*) parentRevision  {
+    if (_parentRevID)
+        return [_document revisionWithID: _parentRevID];
     CBLDocument* document = _document;
     return [document revisionFromRev: [document.database getParentRevision: _rev]];
+}
+
+- (void) _setParentRevisionID: (NSString*)parentRevID {
+    _parentRevID = parentRevID.copy;
 }
 
 
@@ -247,15 +253,6 @@ static inline BOOL isTruthy(id value) {
     return [self createRevisionWithProperties: nil error: outError];
 }
 
-
-#ifdef CBL_DEPRECATED
-- (CBLUnsavedRevision*) newRevision {
-    return [self createRevision];
-}
-- (CBLSavedRevision*) putProperties: (NSDictionary*)properties error: (NSError**)outError {
-    return [self createRevisionWithProperties: properties error: outError];
-}
-#endif
 
 @end
 
@@ -343,7 +340,7 @@ static inline BOOL isTruthy(id value) {
 }
 
 - (void) _addAttachment: (CBLAttachment*)attachment named: (NSString*)name {
-    NSMutableDictionary* atts = [_properties[@"_attachments"] mutableCopy];
+    NSMutableDictionary* atts = [_properties.cbl_attachments mutableCopy];
     if (!atts)
         atts = $mdict();
     [atts setValue: attachment forKey: name];
@@ -356,12 +353,5 @@ static inline BOOL isTruthy(id value) {
     [self _addAttachment: nil named: name];
 }
 
-
-#ifdef CBL_DEPRECATED
-- (void) addAttachment: (CBLAttachment*)attachment named: (NSString*)name {
-    Assert(attachment.revision == nil);
-    [self _addAttachment: attachment named: name];
-}
-#endif
 
 @end

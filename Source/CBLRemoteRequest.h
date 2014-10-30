@@ -16,6 +16,9 @@
 typedef void (^CBLRemoteRequestCompletionBlock)(id result, NSError* error);
 
 
+void CBLWarnUntrustedCert(NSString* host, SecTrustRef trust);
+
+
 /** Asynchronous HTTP request; a fairly simple wrapper around NSURLConnection that calls a completion block when ready. */
 @interface CBLRemoteRequest : NSObject <NSURLConnectionDelegate
 #if TARGET_OS_IPHONE || defined(__MAC_10_8)
@@ -46,6 +49,9 @@ typedef void (^CBLRemoteRequestCompletionBlock)(id result, NSError* error);
 @property NSTimeInterval timeoutInterval;
 @property (strong, nonatomic) id<CBLAuthorizer> authorizer;
 @property (strong, nonatomic) id<CBLRemoteRequestDelegate> delegate;
+
+/** Applies GZip compression to the request body if appropriate. */
+- (BOOL) compressBody;
 
 /** In some cases a kCBLStatusNotFound Not Found is an expected condition and shouldn't be logged; call this to suppress that log message. */
 - (void) dontLog404;

@@ -8,7 +8,8 @@
 
 #import <Foundation/Foundation.h>
 #import "CBLDatabase.h"
-@class CBL_Body, CBL_MutableRevision;
+#import "CBL_Body.h"
+@class CBL_MutableRevision;
 
 
 /** Database sequence ID */
@@ -36,6 +37,9 @@ typedef SInt64 SequenceNumber;
 @property (readonly,copy) NSData* asJSON;
 
 - (id) objectForKeyedSubscript: (NSString*)key;  // enables subscript access in Xcode 4.4+
+
+/** Returns the "_attachments" property, validating that it's a dictionary. */
+@property (readonly) NSDictionary* attachments;
 
 /** Revision's sequence number, or 0 if unknown.
     This property is settable, but only once. That is, it starts out zero and can be
@@ -69,6 +73,11 @@ typedef SInt64 SequenceNumber;
 
 - (void) setObject: (id)object forKeyedSubscript: (NSString*)key;  // subscript access in Xcode 4.4+
 
+/** Calls the block on every attachment dictionary. The block can return a different dictionary,
+    which will be replaced in the rev's properties. If it returns nil, the operation aborts.
+    Returns YES if any changes were made. */
+- (BOOL) mutateAttachments: (NSDictionary*(^)(NSString*, NSDictionary*))block;
+
 @end
 
 
@@ -81,6 +90,7 @@ typedef SInt64 SequenceNumber;
 
 @property (readonly) NSUInteger count;
 
+- (CBL_Revision*) revWithDocID: (NSString*)docID;
 - (CBL_Revision*) revWithDocID: (NSString*)docID revID: (NSString*)revID;
 
 - (NSEnumerator*) objectEnumerator;
@@ -93,6 +103,7 @@ typedef SInt64 SequenceNumber;
 
 - (void) addRev: (CBL_Revision*)rev;
 - (void) removeRev: (CBL_Revision*)rev;
+- (CBL_Revision*) removeAndReturnRev: (CBL_Revision*)rev;  // returns the object removed, or nil
 
 - (void) limit: (NSUInteger)limit;
 - (void) sortBySequence;

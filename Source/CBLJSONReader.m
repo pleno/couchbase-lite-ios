@@ -127,9 +127,9 @@
 
 - (id) nestedTemplate {
     if (self.key)
-        return [$castIf(NSDictionary, _template) objectForKey: self.key];
+        return $castIf(NSDictionary, _template)[self.key];
     else
-        return [$castIf(NSArray, _template) objectAtIndex: 0];
+        return $castIf(NSArray, _template)[0];
 }
 
 - (CBLJSONArrayMatcher*) startArray {
@@ -194,16 +194,25 @@
 
 
 - (BOOL) parseBytes: (const void*)bytes length: (size_t)length {
-    return yajl_parse(_yajl, bytes, length) == yajl_status_ok;
+    CFRetain((__bridge CFTypeRef)self); // keep self from being released during this call
+    BOOL ok = yajl_parse(_yajl, bytes, length) == yajl_status_ok;
+    CFRelease((__bridge CFTypeRef)self);
+    return ok;
 }
 
 - (BOOL) parseData:(NSData *)data {
-    return yajl_parse(_yajl, data.bytes, data.length) == yajl_status_ok;
+    CFRetain((__bridge CFTypeRef)self); // keep self from being released during this call
+    BOOL ok = yajl_parse(_yajl, data.bytes, data.length) == yajl_status_ok;
+    CFRelease((__bridge CFTypeRef)self);
+    return ok;
 }
 
 
 - (BOOL) finish {
-    return yajl_complete_parse(_yajl) == yajl_status_ok;
+    CFRetain((__bridge CFTypeRef)self); // keep self from being released during this call
+    BOOL ok = yajl_complete_parse(_yajl) == yajl_status_ok;
+    CFRelease((__bridge CFTypeRef)self);
+    return ok;
 }
 
 
@@ -358,12 +367,12 @@ static const yajl_callbacks kCallbacks = {
 
 #if DEBUG
 
-@interface GenericObjectMatcher : CBLJSONMatcher
+@interface CBL_GenericObjectMatcher : CBLJSONMatcher
 @property Class arrayMatcherClass;
 @property Class dictMatcherClass;
 @end
 
-@implementation GenericObjectMatcher
+@implementation CBL_GenericObjectMatcher
 {
     id _value;
     Class _arrayMatcherClass, _dictMatcherClass;
@@ -410,7 +419,7 @@ TestCase(CBLJSONMatcher) {
 TestCase(CBLJSONMatcher_Object) {
     NSString* const kJSON = @"{\"foo\": 1, \"bar\": 2}";
 
-    GenericObjectMatcher* matcher = [[GenericObjectMatcher alloc] init];
+    CBL_GenericObjectMatcher* matcher = [[CBL_GenericObjectMatcher alloc] init];
 
     CBLJSONReader* parser = [[CBLJSONReader alloc] initWithMatcher: matcher];
     CAssert([parser parseData: [kJSON dataUsingEncoding: NSUTF8StringEncoding]]);

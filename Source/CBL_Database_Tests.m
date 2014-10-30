@@ -26,6 +26,7 @@
 #import "CBL_BlobStore.h"
 #import "CBLBase64.h"
 #import "CBLInternal.h"
+#import "CouchbaseLitePrivate.h"
 #import "Test.h"
 #import "GTMNSData+zlib.h"
 
@@ -37,6 +38,9 @@ static CBLDatabase* createDB(void) {
     NSString* path = [NSTemporaryDirectory() stringByAppendingPathComponent: @"cbl_test.sqlite3"];
     CBLDatabase *db = [CBLDatabase createEmptyDBAtPath: path];
     CAssert([db open: nil]);
+    AfterThisTest(^{
+        [db _close];
+    });
     return db;
 }
 
@@ -192,8 +196,6 @@ TestCase(CBL_Database_CRUD) {
     // Make sure old rev is missing:
     CAssertNil([db getDocumentWithID: rev1.docID revisionID: rev1.revID]);
 
-    CAssert([db close]);
-    
     [[NSNotificationCenter defaultCenter] removeObserver: observer];
 }
 
@@ -202,12 +204,11 @@ TestCase(CBL_Database_EmptyDoc) {
     // Test case for issue #44, which is caused by a bug in CBLJSON.
     CBLDatabase* db = createDB();
     CBL_Revision* rev = putDoc(db, $dict());
-    CBLQueryOptions options = kDefaultCBLQueryOptions;
-    options.includeDocs = YES;
+    CBLQueryOptions *options = [CBLQueryOptions new];
+    options->includeDocs = YES;
     NSArray* keys = @[rev.docID];
     options.keys = keys;
-    [db getAllDocs: &options]; // raises an exception :(
-    CAssert([db close]);
+    [db getAllDocs: options]; // raises an exception :(
 }
 
 
@@ -236,7 +237,6 @@ TestCase(CBL_Database_DeleteWithProperties) {
     CAssert([rev3.revID hasPrefix: @"3-"]);     // new rev is child of tombstone rev
     readRev = [db getDocumentWithID: rev2.docID revisionID: nil];
     CAssertEqual(readRev.revID, rev3.revID);
-    CAssert([db close]);
 }
 
 
@@ -250,7 +250,6 @@ TestCase(CBL_Database_DeleteAndRecreate) {
     Log(@"Deleted: %@ -- %@", rev2, rev2.properties);
     CBL_Revision* rev3 = putDoc(db, $dict({@"_id", @"dock"}, {@"property", @"value"}));
     Log(@"Recreated: %@ -- %@", rev3, rev3.properties);
-    CAssert([db close]);
 }
 
 
@@ -264,17 +263,20 @@ static CBL_Revision* revBySettingProperties(CBL_Revision* rev, NSDictionary* pro
 TestCase(CBL_Database_Validation) {
     CBLDatabase* db = createDB();
     __block BOOL validationCalled = NO;
+    __block NSString* expectedParentRevID = nil;
     [db setValidationNamed: @"hoopy" 
                  asBlock: ^void(CBLRevision *newRevision, id<CBLValidationContext> context)
     {
         CAssert(newRevision);
         CAssert(context);
         CAssert(newRevision.properties || newRevision.isDeletion);
+        CAssertNil(newRevision.revisionID);
         validationCalled = YES;
         BOOL hoopy = newRevision.isDeletion || newRevision[@"towel"] != nil;
         Log(@"--- Validating %@ --> %d", newRevision.properties, hoopy);
         if (!hoopy)
             [context rejectWithMessage: @"Where's your towel?"];
+        AssertEqual(newRevision.parentRevisionID, expectedParentRevID);
     }];
     
     // POST a valid new document:
@@ -282,6 +284,7 @@ TestCase(CBL_Database_Validation) {
     CBL_Revision* rev = [[CBL_Revision alloc] initWithProperties: props];
     CBLStatus status;
     validationCalled = NO;
+    expectedParentRevID = nil;
     rev = [db putRevision: rev prevRevisionID: nil allowConflict: NO status: &status];
     CAssert(validationCalled);
     CAssertEq(status, kCBLStatusCreated);
@@ -290,6 +293,7 @@ TestCase(CBL_Database_Validation) {
     props[@"head_count"] = @3;
     rev = revBySettingProperties(rev, props);
     validationCalled = NO;
+    expectedParentRevID = rev.revID;
     rev = [db putRevision: rev prevRevisionID: rev.revID allowConflict: NO status: &status];
     CAssert(validationCalled);
     CAssertEq(status, kCBLStatusCreated);
@@ -298,7 +302,8 @@ TestCase(CBL_Database_Validation) {
     [props removeObjectForKey: @"towel"];
     rev = revBySettingProperties(rev, props);
     validationCalled = NO;
-#pragma unused (rev)  // tell analyzer to ignore dead stores below
+    expectedParentRevID = rev.revID;
+#pragma unused(rev)
     rev = [db putRevision: rev prevRevisionID: rev.revID allowConflict: NO status: &status];
     CAssert(validationCalled);
     CAssertEq(status, kCBLStatusForbidden);
@@ -307,6 +312,7 @@ TestCase(CBL_Database_Validation) {
     props = $mdict({@"name", @"Vogon"}, {@"poetry", $true});
     rev = [[CBL_Revision alloc] initWithProperties: props];
     validationCalled = NO;
+    expectedParentRevID = nil;
     rev = [db putRevision: rev prevRevisionID: nil allowConflict: NO status: &status];
     CAssert(validationCalled);
     CAssertEq(status, kCBLStatusForbidden);
@@ -317,6 +323,7 @@ TestCase(CBL_Database_Validation) {
     validationCalled = NO;
     rev = [db putRevision: rev prevRevisionID: nil allowConflict: NO status: &status];
     CAssert(validationCalled);
+    expectedParentRevID = nil;
     CAssertEq(status, kCBLStatusCreated);
     CAssertEqual(rev.docID, @"ford");
     
@@ -324,7 +331,8 @@ TestCase(CBL_Database_Validation) {
     rev = [[CBL_Revision alloc] initWithDocID: rev.docID revID: rev.revID deleted: YES];
     CAssert(rev.deleted);
     validationCalled = NO;
-    rev = [db putRevision: rev prevRevisionID:  rev.revID allowConflict: NO status: &status];
+    expectedParentRevID = rev.revID;
+    rev = [db putRevision: rev prevRevisionID: rev.revID allowConflict: NO status: &status];
     CAssertEq(status, kCBLStatusOK);
     CAssert(validationCalled);
 
@@ -332,15 +340,14 @@ TestCase(CBL_Database_Validation) {
     props = $mdict({@"_id", @"petunias"}, {@"name", @"Pot of Petunias"});
     rev = [[CBL_Revision alloc] initWithProperties: props];
     validationCalled = NO;
+    expectedParentRevID = nil;
     rev = [db putRevision: rev prevRevisionID: nil allowConflict: NO status: &status];
     CAssert(validationCalled);
     CAssertEq(status, kCBLStatusForbidden);
-    
-    CAssert([db close]);
 }
 
 
-static void verifyHistory(CBLDatabase* db, CBL_Revision* rev, NSArray* history, bool afterCompact) {
+static void verifyHistory(CBLDatabase* db, CBL_Revision* rev, NSArray* history, unsigned nExistingRevs) {
     CBL_Revision* gotRev = [db getDocumentWithID: rev.docID revisionID: nil];
     CAssertEqual(gotRev, rev);
     CAssertEqual(gotRev.properties, rev.properties);
@@ -352,7 +359,9 @@ static void verifyHistory(CBLDatabase* db, CBL_Revision* rev, NSArray* history, 
         CAssertEqual(hrev.docID, rev.docID);
         CAssertEqual(hrev.revID, history[i]);
         CAssert(!hrev.deleted);
-        CAssertEq(hrev.missing, i > 0);
+
+        BOOL expectedMissing = i > 0 && (history.count - i) > nExistingRevs;
+        CAssert(hrev.missing == expectedMissing, @"hrev[%d].missing = %d, should be %d", i, hrev.missing, expectedMissing);
     }
 }
 
@@ -388,8 +397,9 @@ TestCase(CBL_Database_RevTree) {
     CBLStatus status = [db forceInsert: rev revisionHistory: history source: nil];
     CAssertEq(status, kCBLStatusCreated);
     CAssertEq(db.documentCount, 1u);
-    verifyHistory(db, rev, history, false);
+    verifyHistory(db, rev, history, 0);
     CAssertEqual(change, announcement(rev, rev));
+    CAssert(!change.inConflict);
 
 
     CBL_MutableRevision* conflict = [[CBL_MutableRevision alloc] initWithDocID: @"MyDocID" revID: @"5-epsilon" deleted: NO];
@@ -400,8 +410,9 @@ TestCase(CBL_Database_RevTree) {
     status = [db forceInsert: conflict revisionHistory: conflictHistory source: nil];
     CAssertEq(status, kCBLStatusCreated);
     CAssertEq(db.documentCount, 1u);
-    verifyHistory(db, conflict, conflictHistory, false);
+    verifyHistory(db, conflict, conflictHistory, 0);
     CAssertEqual(change, announcement(conflict, conflict));
+    CAssert(change.inConflict);
 
     // Add an unrelated document:
     CBL_MutableRevision* other = [[CBL_MutableRevision alloc] initWithDocID: @"AnotherDocID" revID: @"1-ichi" deleted: NO];
@@ -410,6 +421,7 @@ TestCase(CBL_Database_RevTree) {
     status = [db forceInsert: other revisionHistory: @[other.revID] source: nil];
     CAssertEq(status, kCBLStatusCreated);
     CAssertEqual(change, announcement(other, other));
+    CAssert(!change.inConflict);
 
     // Fetch one of those phantom revisions with no body:
     CBL_Revision* rev2 = [db getDocumentWithID: rev.docID revisionID: @"2-too"];
@@ -436,7 +448,7 @@ TestCase(CBL_Database_RevTree) {
 
     // Verify that compaction leaves the document history:
     [db compact];
-    verifyHistory(db, conflict, conflictHistory, true);
+    verifyHistory(db, conflict, conflictHistory, 0);
 
     // Delete the current winning rev, leaving the other one:
     CBL_Revision* del1 = [[CBL_Revision alloc] initWithDocID: conflict.docID revID: nil deleted: YES];
@@ -448,7 +460,7 @@ TestCase(CBL_Database_RevTree) {
     CAssertEqual(current, rev);
     CAssertEqual(change, announcement(del1, rev));
     
-    verifyHistory(db, rev, history, true);
+    verifyHistory(db, rev, history, 0);
 
     // Delete the remaining rev:
     CBL_Revision* del2 = [[CBL_Revision alloc] initWithDocID: rev.docID revID: nil deleted: YES];
@@ -461,6 +473,7 @@ TestCase(CBL_Database_RevTree) {
 
     CBL_Revision* maxDel = CBLCompareRevIDs(del1.revID, del2.revID) > 0 ? del1 : nil;
     CAssertEqual(change, announcement(del2, maxDel));
+    CAssert(!change.inConflict);
 
     NSUInteger nPruned;
     CAssertEq([db pruneRevsToMaxDepth: 2 numberPruned: &nPruned], 200);
@@ -469,7 +482,50 @@ TestCase(CBL_Database_RevTree) {
     CAssertEq(nPruned, 0u);
 
     [[NSNotificationCenter defaultCenter] removeObserver: observer];
-    CAssert([db close]);
+}
+
+
+TestCase(CBL_Database_RevTreeConflict) {
+    RequireTestCase(CBL_Database_RevTree);
+    // Start with a fresh database in /tmp:
+    CBLDatabase* db = createDB();
+
+    // Track the latest database-change notification that's posted:
+    __block CBLDatabaseChange* change = nil;
+    id observer = [[NSNotificationCenter defaultCenter]
+     addObserverForName: CBL_DatabaseChangesNotification
+     object: db
+     queue: nil
+     usingBlock: ^(NSNotification *n) {
+         NSArray* changes = n.userInfo[@"changes"];
+         CAssert(changes.count == 1, @"Multiple changes posted!");
+         CAssert(!change, @"Multiple notifications posted!");
+         change = changes[0];
+     }];
+
+    CBL_MutableRevision* rev = [[CBL_MutableRevision alloc] initWithDocID: @"MyDocID" revID: @"1-won" deleted: NO];
+    rev.properties = $dict({@"_id", rev.docID}, {@"_rev", rev.revID}, {@"message", @"hi"});
+    NSArray* history = @[rev.revID];
+    change = nil;
+    CBLStatus status = [db forceInsert: rev revisionHistory: history source: nil];
+    CAssertEq(status, 201);
+    CAssertEq(db.documentCount, 1u);
+    CAssert(!change.inConflict);
+    verifyHistory(db, rev, history, 0);
+    CAssertEqual(change, announcement(rev, rev));
+
+    rev = [[CBL_MutableRevision alloc] initWithDocID: @"MyDocID" revID: @"4-foxy" deleted: NO];
+    rev.properties = $dict({@"_id", rev.docID}, {@"_rev", rev.revID}, {@"message", @"hi"});
+    history = @[rev.revID, @"3-thrice", @"2-too", @"1-won"];
+    change = nil;
+    status = [db forceInsert: rev revisionHistory: history source: nil];
+    CAssertEq(status, kCBLStatusCreated);
+    CAssertEq(db.documentCount, 1u);
+    CAssert(!change.inConflict);
+    verifyHistory(db, rev, history, 1);
+    CAssertEqual(change, announcement(rev, rev));
+
+    [[NSNotificationCenter defaultCenter] removeObserver: observer];
 }
 
 
@@ -477,12 +533,12 @@ TestCase(CBL_Database_DeterministicRevIDs) {
     CBLDatabase* db = createDB();
     CBL_Revision* rev = putDoc(db, $dict({@"_id", @"mydoc"}, {@"key", @"value"}));
     NSString* revID = rev.revID;
-    CAssert([db close]);
+    [db _close];
 
     db = createDB();
     rev = putDoc(db, $dict({@"_id", @"mydoc"}, {@"key", @"value"}));
     CAssertEqual(rev.revID, revID);
-    CAssert([db close]);
+    [db _close];
 }
 
 
@@ -503,7 +559,6 @@ TestCase(CBL_Database_DuplicateRev) {
                      status: &status];
     CAssertEq(status, kCBLStatusOK);
     CAssertEqual(rev2b, rev2a);
-    CAssert([db close]);
 }
 
 
@@ -641,7 +696,6 @@ TestCase(CBL_Database_Attachments) {
     CAssertEq([db compact], kCBLStatusOK);  // This clears the body of the first revision
     CAssertEq(attachments.count, 1u);
     CAssertEqual(attachments.allKeys, @[[CBL_BlobStore keyDataForBlob: attach2]]);
-    CAssert([db close]);
 }
 
 
@@ -747,8 +801,47 @@ TestCase(CBL_Database_PutAttachment) {
     
     // Get the updated revision:
     CBL_Revision* gotRev3 = [db getDocumentWithID: rev3.docID revisionID: rev3.revID];
-    CAssertNil([gotRev3.properties objectForKey: @"_attachments"]);
-    CAssert([db close]);
+    CAssertNil((gotRev3.properties)[@"_attachments"]);
+}
+
+
+// Test that updating an attachment via a PUT correctly updates its revpos.
+TestCase(CBL_Database_AttachmentRevPos) {
+    RequireTestCase(CBL_Database_PutAttachment);
+    CBLDatabase* db = createDB();
+
+    // Put a revision that includes an _attachments dict:
+    NSData* attach1 = [@"This is the body of attach1" dataUsingEncoding: NSUTF8StringEncoding];
+    NSString* base64 = [CBLBase64 encode: attach1];
+    NSDictionary* attachmentDict = $dict({@"attach", $dict({@"content_type", @"text/plain"},
+                                                           {@"data", base64})});
+    NSDictionary* props = $dict({@"foo", @1},
+                                {@"bar", $false},
+                                {@"_attachments", attachmentDict});
+    CBL_Revision* rev1;
+    CBLStatus status;
+    rev1 = [db putRevision: [CBL_Revision revisionWithProperties: props]
+            prevRevisionID: nil allowConflict: NO status: &status];
+    CAssertEq(status, kCBLStatusCreated);
+
+    CAssertEqual((rev1[@"_attachments"])[@"attach"][@"revpos"], @1);
+
+    // Update the attachment with another PUT:
+    NSData* attach2 = [@"This WAS the body of attach1" dataUsingEncoding: NSUTF8StringEncoding];
+    base64 = [CBLBase64 encode: attach2];
+    attachmentDict = $dict({@"attach", $dict({@"content_type", @"text/plain"},
+                                             {@"data", base64})});
+    props = $dict({@"_id", rev1.docID},
+                  {@"foo", @2},
+                  {@"bar", $true},
+                  {@"_attachments", attachmentDict});
+    CBL_Revision* rev2;
+    rev2 = [db putRevision: [CBL_Revision revisionWithProperties: props]
+            prevRevisionID: rev1.revID allowConflict: NO status: &status];
+    CAssertEq(status, kCBLStatusCreated);
+
+    // The punch line: Did the revpos get incremented to 2?
+    CAssertEqual((rev2[@"_attachments"])[@"attach"][@"revpos"], @2);
 }
 
 
@@ -824,7 +917,6 @@ TestCase(CBL_Database_EncodedAttachment) {
                             options: kCBLIncludeAttachments
                              status: &status];
     CAssertEqual(gotRev1[@"_attachments"], attachmentDict);
-    CAssert([db close]);
 }
 
 
@@ -881,7 +973,6 @@ TestCase(CBL_Database_ReplicatorSequences) {
     [db setLastSequence: @"lastpush" withCheckpointID: @"push"];
     CAssertEqual([db lastSequenceWithCheckpointID: @"pull"], @"newerpull");
     CAssertEqual([db lastSequenceWithCheckpointID: @"push"], @"lastpush");
-    CAssert([db close]);
 }
 
 
@@ -944,8 +1035,6 @@ TestCase(CBL_Database_LocalDocs) {
     // Read it back (should fail):
     readRev = [db getLocalDocumentWithID: revD.docID revisionID: nil];
     CAssertNil(readRev);
-    
-    CAssert([db close]);
 }
 
 
@@ -981,7 +1070,6 @@ TestCase(CBL_Database_FindMissingRevisions) {
     CAssertEqual([db getPossibleAncestorRevisionIDs: revToFind3 limit: 0 hasAttachment: &hasAtt],
                  nil);
     CAssertEq(hasAtt, NO);
-    CAssert([db close]);
 }
 
 
@@ -1008,7 +1096,6 @@ TestCase(CBL_Database_Purge) {
 
     CBL_RevisionList* remainingRevs = [db getAllRevisionsOfDocumentID: @"doc" onlyCurrent: NO];
     CAssertEq(remainingRevs.count, 0u);
-    CAssert([db close]);
 }
 
 
@@ -1016,6 +1103,7 @@ TestCase(CBLDatabase) {
     RequireTestCase(CBL_Database_CRUD);
     RequireTestCase(CBL_Database_DeleteWithProperties);
     RequireTestCase(CBL_Database_RevTree);
+    RequireTestCase(CBL_Database_RevTreeConflict);
     RequireTestCase(CBL_Database_LocalDocs);
     RequireTestCase(CBL_Database_FindMissingRevisions);
     RequireTestCase(CBL_Database_Purge);

@@ -146,15 +146,17 @@ static NSData* kCRLFCRLF;
     [_buffer replaceBytesInRange: NSMakeRange(0, NSMaxRange(r)) withBytes: NULL length: 0];
 }
 
-- (void) trimBuffer {
+- (BOOL) appendAndTrimBuffer {
     NSUInteger bufLen = _buffer.length;
     NSUInteger boundaryLen = _boundary.length;
     if (bufLen > boundaryLen) {
         // Leave enough bytes in _buffer that we can find an incomplete boundary string
         NSRange trim = NSMakeRange(0, bufLen - boundaryLen);
-        [_delegate appendToPart: [_buffer subdataWithRange: trim]];
+        if (![_delegate appendToPart: [_buffer subdataWithRange: trim]])
+            return NO;
         [self deleteUpThrough: trim];
     }
+    return YES;
 }
 
 
@@ -167,6 +169,10 @@ static NSData* kCRLFCRLF;
     if (!_error)
         _error = [error copy];
     [self close];
+}
+
+- (void) stop {
+    self.error = @"Stopped";
 }
          
 
@@ -208,13 +214,19 @@ static NSData* kCRLFCRLF;
                 NSRange r = [self searchFor: _boundary from: start];
                 if (r.length > 0) {
                     if (_state == kInBody) {
-                        [delegate appendToPart: [_buffer subdataWithRange: NSMakeRange(0, r.location)]];
-                        [delegate finishedPart];
+                        if (![delegate appendToPart: [_buffer subdataWithRange: NSMakeRange(0, r.location)]]
+                                || ![delegate finishedPart]) {
+                            [self stop];
+                            break;
+                        }
                     }
                     [self deleteUpThrough: r];
                     nextState = kInHeaders;
                 } else {
-                    [self trimBuffer];
+                    if (![self appendAndTrimBuffer]) {
+                        [self stop];
+                        break;
+                    }
                 }
                 break;
             }
@@ -237,7 +249,10 @@ static NSData* kCRLFCRLF;
                     if (!ok)
                         return;  // parseHeaders already set .error
                     [self deleteUpThrough: r];
-                    [delegate startedPart: _headers];
+                    if (![delegate startedPart: _headers]) {
+                        [self stop];
+                        break;
+                    }
                     nextState = kInBody;
                 }
                 break;
@@ -269,9 +284,11 @@ static NSData* kCRLFCRLF;
 
 
 #if DEBUG  //// UNIT TESTS:
+#import "CBLMisc.h"
+#import "GTMNSData+zlib.h"
 
 
-@interface TestMultipartReaderDelegate : NSObject <CBLMultipartReaderDelegate>
+@interface CBL_TestMultipartReaderDelegate : NSObject <CBLMultipartReaderDelegate>
 {
     NSMutableData* _currentPartData;
     NSMutableArray* _partList, *_headersList;
@@ -280,11 +297,11 @@ static NSData* kCRLFCRLF;
 @end
 
 
-@implementation TestMultipartReaderDelegate
+@implementation CBL_TestMultipartReaderDelegate
 
 @synthesize partList=_partList, headerList=_headersList;
 
-- (void) startedPart: (NSDictionary*)headers {
+- (BOOL) startedPart: (NSDictionary*)headers {
     Assert(!_currentPartData);
     _currentPartData = [[NSMutableData alloc] init];
     if (!_partList)
@@ -293,17 +310,19 @@ static NSData* kCRLFCRLF;
     if (!_headersList)
         _headersList = [[NSMutableArray alloc] init];
     [_headersList addObject: headers];
+    return YES;
 }
 
-- (void) appendToPart: (NSData*)data {
+- (BOOL) appendToPart: (NSData*)data {
     Assert(_currentPartData);
     [_currentPartData appendData: data];
+    return YES;
 }
 
-- (void) finishedPart {
+- (BOOL) finishedPart {
     Assert(_currentPartData);
     _currentPartData = nil;
-    
+    return YES;
 }
 
 
@@ -339,7 +358,7 @@ TestCase(CBLMultipartReader_Simple) {
 
     for (NSUInteger chunkSize = 1; chunkSize <= mime.length; ++chunkSize) {
         Log(@"--- chunkSize = %u", (unsigned)chunkSize);
-        TestMultipartReaderDelegate* delegate = [[TestMultipartReaderDelegate alloc] init];
+        CBL_TestMultipartReaderDelegate* delegate = [[CBL_TestMultipartReaderDelegate alloc] init];
         CBLMultipartReader* reader = [[CBLMultipartReader alloc] initWithContentType: @"multipart/related; boundary=\"BOUNDARY\"" delegate: delegate];
         CAssert(!reader.finished);
         
@@ -354,6 +373,23 @@ TestCase(CBLMultipartReader_Simple) {
         CAssertEqual(delegate.partList, expectedParts);
         CAssertEqual(delegate.headerList, expectedHeaders);
     }
+}
+
+TestCase(CBLMultipartReader_GZipped) {
+    NSData* mime = CBLContentsOfTestFile(@"MultipartStars.mime");
+    CBL_TestMultipartReaderDelegate* delegate = [[CBL_TestMultipartReaderDelegate alloc] init];
+    CBLMultipartReader* reader = [[CBLMultipartReader alloc] initWithContentType: @"multipart/related; boundary=\"BOUNDARY\"" delegate: delegate];
+    [reader appendData: mime];
+    Assert(reader.finished);
+
+    CAssertEqual(delegate.headerList, (@[@{@"Content-Encoding": @"gzip",
+                                           @"Content-Length": @"24",
+                                           @"Content-Type": @"star-bellies"}]));
+
+    NSData* stars = [NSData gtm_dataByInflatingData: delegate.partList[0]];
+    AssertEq(stars.length, 100u);
+    for (int i=0; i<100; i++)
+        AssertEq(((char*)stars.bytes)[i], '*');
 }
 
 #endif

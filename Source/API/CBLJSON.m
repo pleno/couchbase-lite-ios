@@ -85,6 +85,35 @@ static NSTimeInterval k1970ToReferenceDate;
 }
 
 
+#define kObjectOverhead 20
+
+static size_t estimate(id object) {
+    if ([object isKindOfClass: [NSString class]]) {
+        return kObjectOverhead + 2*[object length];
+    } else if ([object isKindOfClass: [NSNumber class]]) {
+        return kObjectOverhead + 8;
+    } else if ([object isKindOfClass: [NSDictionary class]]) {
+        size_t size = kObjectOverhead + sizeof(NSUInteger);
+        for (NSString* key in object)
+            size += (kObjectOverhead + 2*[key length]) + estimate(object[key]);
+        return size;
+    } else if ([object isKindOfClass: [NSArray class]]) {
+        size_t size = kObjectOverhead + sizeof(NSUInteger);
+        for (id item in object)
+            size += estimate(item);
+        return size;
+    } else if ([object isKindOfClass: [NSNull class]]) {
+        return kObjectOverhead;
+    } else {
+        Assert(NO, @"Illegal object type %@ in JSON", [object class]);
+    }
+}
+
++ (size_t) estimateMemorySize: (id)object {
+    return object ? estimate(object) : 0;
+}
+
+
 #pragma mark - DATE CONVERSION:
 
 
@@ -95,19 +124,25 @@ static NSDateFormatter* getISO8601Formatter() {
     if (!sFormatter) {
         // Thanks to DenNukem's answer in http://stackoverflow.com/questions/399527/
         sFormatter = [[NSDateFormatter alloc] init];
-        sFormatter.dateFormat = @"yyyy-MM-dd'T'HH:mm:ss.SSS'Z'";
-        sFormatter.timeZone = [NSTimeZone timeZoneForSecondsFromGMT:0];
+        sFormatter.dateFormat = @"yyyy-MM-dd'T'HH:mm:ss.SSSXXX";
         sFormatter.calendar = [[NSCalendar alloc] initWithCalendarIdentifier:NSGregorianCalendar];
         sFormatter.locale = [[NSLocale alloc] initWithLocaleIdentifier:@"en_US"];
     }
+
     return sFormatter;
 }
 
 + (NSString*) JSONObjectWithDate: (NSDate*)date {
+    return [self JSONObjectWithDate:date timeZone:[NSTimeZone timeZoneForSecondsFromGMT:0]];
+}
+
++ (NSString*) JSONObjectWithDate: (NSDate*)date timeZone:(NSTimeZone *)tz {
     if (!date)
         return nil;
     @synchronized(self) {
-        return [getISO8601Formatter() stringFromDate: date];
+        NSDateFormatter *formatter = getISO8601Formatter();
+        formatter.timeZone = tz;
+        return [formatter stringFromDate: date];
     }
 }
 
@@ -154,14 +189,14 @@ static NSDateFormatter* getISO8601Formatter() {
                 return nil;
             key = [key stringByReplacingOccurrencesOfString: @"~1" withString: @"/"];
             key = [key stringByReplacingOccurrencesOfString: @"~0" withString: @"~"];
-            object = [object objectForKey: key];
+            object = object[key];
             if (!object)
                 return nil;
         } else if ([object isKindOfClass: [NSArray class]]) {
             int index;
             if (![scanner scanInt: &index] || index < 0 || index >= (int)[object count])
                 return nil;
-            object = [object objectAtIndex: index];
+            object = object[index];
         } else {
             return nil;
         }
@@ -195,11 +230,11 @@ static NSDateFormatter* getISO8601Formatter() {
 }
 
 - (id)objectAtIndex:(NSUInteger)index {
-    id obj = [_array objectAtIndex: index];
+    id obj = _array[index];
     if ([obj isKindOfClass: [NSData class]]) {
         obj = [CBLJSON JSONObjectWithData: obj options: CBLJSONReadingAllowFragments
                                    error: nil];
-        [_array replaceObjectAtIndex: index withObject: obj];
+        _array[index] = obj;
     }
     return obj;
 }
@@ -223,6 +258,14 @@ TestCase(CBLJSON_Date) {
     CAssert(isnan([CBLJSON absoluteTimeWithJSONObject: @""]));
 
     CAssertEqual([CBLJSON JSONObjectWithDate: date], @"2013-04-01T20:42:33.388Z");
+
+    date = [CBLJSON dateWithJSONObject:@"2014-07-30T17:09:00.000+02:00"];
+
+    CAssertEqual([CBLJSON JSONObjectWithDate:date
+                                    timeZone:[NSTimeZone timeZoneForSecondsFromGMT:3600*2]], @"2014-07-30T17:09:00.000+02:00");
+
+    CAssertEqual([CBLJSON JSONObjectWithDate:date
+                                    timeZone:[NSTimeZone timeZoneForSecondsFromGMT:0]], @"2014-07-30T15:09:00.000Z");
 }
 
 

@@ -22,6 +22,7 @@
 #import "CBLMisc.h"
 #import "CBLStatus.h"
 #import "CBLJSONReader.h"
+#import "MYURLUtils.h"
 
 
 #define kDefaultHeartbeat (20.0)
@@ -53,7 +54,7 @@ typedef void (^CBLChangeMatcherClient)(id sequence, NSString* docID, NSArray* re
 @synthesize limit=_limit, heartbeat=_heartbeat, error=_error, continuous=_continuous;
 @synthesize client=_client, filterName=_filterName, filterParameters=_filterParameters;
 @synthesize requestHeaders = _requestHeaders, authorizer=_authorizer;
-@synthesize docIDs = _docIDs, pollInterval=_pollInterval;
+@synthesize docIDs = _docIDs, pollInterval=_pollInterval, usePOST=_usePOST;
 
 - (instancetype) initWithDatabaseURL: (NSURL*)databaseURL
                                 mode: (CBLChangeTrackerMode)mode
@@ -95,6 +96,9 @@ typedef void (^CBLChangeMatcherClient)(id sequence, NSString* docID, NSArray* re
 }
 
 - (NSString*) changesFeedPath {
+    if (_usePOST)
+        return @"_changes";
+    
     NSMutableString* path;
     path = [NSMutableString stringWithFormat: @"_changes?feed=%@&heartbeat=%.0f",
                                               self.feed, _heartbeat*1000.0];
@@ -144,6 +148,60 @@ typedef void (^CBLChangeMatcherClient)(id sequence, NSString* docID, NSArray* re
     return CBLAppendToURL(_databaseURL, self.changesFeedPath);
 }
 
+- (NSData*) changesFeedPOSTBody {
+    // The replicator always stores the last sequence as a string, but the server may treat it as
+    // an integer. As a heuristic, convert it to a number if it looks like one:
+    id since = _lastSequenceID;
+    NSInteger n;
+    if ([since isKindOfClass: [NSString class]] && CBLParseInteger(since, &n) && n >= 0)
+        since = @(n);
+
+    NSString* filterName = _filterName;
+    NSDictionary* filterParameters = _filterParameters;
+    if (_docIDs) {
+        filterName = @"_doc_ids";
+        filterParameters = @{@"doc_ids": _docIDs};
+    }
+    NSMutableDictionary* post = $mdict({@"feed", self.feed},
+                                       {@"heartbeat", @(_heartbeat*1000.0)},
+                                       {@"style", (_includeConflicts ? @"all_docs" : nil)},
+                                       {@"since", since},
+                                       {@"limit", (_limit > 0 ? @(_limit) : nil)},
+                                       {@"filter", filterName});
+    if (filterName && filterParameters)
+        [post addEntriesFromDictionary: filterParameters];
+    return [CBLJSON dataWithJSONObject: post options: 0 error: NULL];
+}
+
+- (NSDictionary*) TLSSettings {
+    if (!_databaseURL.my_isHTTPS)
+        return nil;
+    // Enable SSL for this connection.
+    // Disable TLS 1.2 support because it breaks compatibility with some SSL servers;
+    // workaround taken from Apple technote TN2287:
+    // http://developer.apple.com/library/ios/#technotes/tn2287/
+    // Disable automatic cert-chain checking, because that's the only way to allow self-signed
+    // certs. We will check the cert later in -checkSSLCert.
+    return $dict( {(id)kCFStreamSSLLevel, (id)kCFStreamSocketSecurityLevelTLSv1},
+                  {(id)kCFStreamSSLValidatesCertificateChain, @NO} );
+}
+
+
+- (BOOL) checkServerTrust: (SecTrustRef)sslTrust forURL: (NSURL*)url {
+    BOOL trusted = [_client changeTrackerApproveSSLTrust: sslTrust
+                                                 forHost: url.host
+                                                    port: (UInt16)url.port.intValue];
+    if (!trusted) {
+        //TODO: This error could be made more precise
+        LogTo(ChangeTracker, @"%@: Rejected server certificate", self);
+        [self failedWithError: [NSError errorWithDomain: NSURLErrorDomain
+                                                   code: NSURLErrorServerCertificateUntrusted
+                                               userInfo: nil]];
+    }
+    return trusted;
+}
+
+
 - (NSString*) description {
     return [NSString stringWithFormat: @"%@[%p %@]", [self class], self, self.databaseName];
 }
@@ -180,6 +238,21 @@ typedef void (^CBLChangeMatcherClient)(id sequence, NSString* docID, NSArray* re
 
 
 - (void) failedWithError: (NSError*)error {
+    // Map lower-level errors from CFStream to higher-level NSURLError ones:
+    NSString* domain = error.domain;
+    NSInteger code = error.code;
+    if ($equal(domain, NSPOSIXErrorDomain)) {
+        if (code == ECONNREFUSED)
+            error = [NSError errorWithDomain: NSURLErrorDomain
+                                        code: NSURLErrorCannotConnectToHost
+                                    userInfo: error.userInfo];
+    } else if ($equal(domain, NSURLErrorDomain)) {
+        if (code == NSURLErrorUserAuthenticationRequired)
+            error = [NSError errorWithDomain: CBLHTTPErrorDomain
+                                        code: kCBLStatusUnauthorized
+                                    userInfo: error.userInfo];
+    }
+
     // If the error may be transient (flaky network, server glitch), retry:
     if (!CBLIsPermanentError(error) && (_continuous || CBLMayBeTransientError(error))) {
         NSTimeInterval retryDelay = kInitialRetryDelay * (1 << MIN(_retryCount, 16U));
@@ -238,7 +311,11 @@ typedef void (^CBLChangeMatcherClient)(id sequence, NSString* docID, NSArray* re
 }
 
 - (NSInteger) endParsingData {
-    Assert(_parser);
+    if (!_parser) {
+        Warn(@"Connection closed before first byte");
+        return - 1;
+    }
+    
     BOOL ok = [_parser finish];
     _parser = nil;
     if (!ok) {
@@ -333,7 +410,7 @@ typedef void (^CBLChangeMatcherClient)(id sequence, NSString* docID, NSArray* re
 
 - (id) end {
     //Log(@"Ended ChangeMatcher with seq=%@, id='%@', deleted=%d, revs=%@", _sequence, _docID, _deleted, _revs);
-    if (!_sequence || !_docID || _revs.count == 0)
+    if (!_sequence || !_docID)
         return nil;
     _client(_sequence, _docID, [_revs copy], _deleted);
     _sequence = nil;

@@ -363,54 +363,33 @@ static bool digestToBlobKey(NSString* digest, CBLBlobKey* key) {
 
 - (NSURL*) fileForAttachmentDict: (NSDictionary*)attachmentDict
 {
-    CBLBlobKey key;
-    if (!digestToBlobKey(attachmentDict[@"digest"], &key))
+    NSString* digest = $castIf(NSString, attachmentDict[@"digest"]);
+    if (!digest)
         return nil;
-    return [NSURL fileURLWithPath: [_attachments pathForKey: key]];
-}
-
-
-// Calls the block on every attachment dictionary. The block can return a different dictionary,
-// which will be replaced in the rev's properties. If it returns nil, the operation aborts.
-// Returns YES if any changes were made.
-+ (BOOL) mutateAttachmentsIn: (CBL_MutableRevision*)rev
-                   withBlock: (NSDictionary*(^)(NSString*, NSDictionary*))block
-{
-    NSDictionary* properties = rev.properties;
-    NSMutableDictionary* editedProperties = nil;
-    NSDictionary* attachments = (id)properties[@"_attachments"];
-    NSMutableDictionary* editedAttachments = nil;
-    for (NSString* name in attachments) {
-        @autoreleasepool {
-            NSDictionary* attachment = attachments[name];
-            NSDictionary* editedAttachment = block(name, attachment);
-            if (!editedAttachment) {
-                return NO;  // block canceled
-            }
-            if (editedAttachment != attachment) {
-                if (!editedProperties) {
-                    // Make the document properties and _attachments dictionary mutable:
-                    editedProperties = [properties mutableCopy];
-                    editedAttachments = [attachments mutableCopy];
-                    editedProperties[@"_attachments"] = editedAttachments;
-                }
-                editedAttachments[name] = editedAttachment;
-            }
+    NSString* path = nil;
+    id pending = _pendingAttachmentsByDigest[digest];
+    if (pending) {
+        if ([pending isKindOfClass: [CBL_BlobStoreWriter class]]) {
+            path = [pending filePath];
+        } else {
+            CBLBlobKey key = *(CBLBlobKey*)[pending bytes];
+            path = [_attachments pathForKey: key];
         }
+    } else {
+        // If it's an installed attachment, ask the blob-store for it:
+        CBLBlobKey key;
+        if (digestToBlobKey(digest, &key))
+            path = [_attachments pathForKey: key];
     }
-    if (editedProperties) {
-        rev.properties = editedProperties;
-        return YES;
-    }
-    return NO;
+
+    return path ? [NSURL fileURLWithPath: path] : nil;
 }
 
 
 + (void) stubOutAttachments: (NSDictionary*)attachments
                  inRevision: (CBL_MutableRevision*)rev
 {
-    [self mutateAttachmentsIn: rev
-                    withBlock: ^NSDictionary *(NSString *name, NSDictionary *attachment) {
+    [rev mutateAttachments: ^NSDictionary *(NSString *name, NSDictionary *attachment) {
         if (attachment[@"follows"] || attachment[@"data"]) {
             NSMutableDictionary* editedAttachment = [attachment mutableCopy];
             [editedAttachment removeObjectForKey: @"follows"];
@@ -439,8 +418,7 @@ static bool digestToBlobKey(NSString* digest, CBLBlobKey* key) {
 {
     if (minRevPos <= 1 && !attachmentsFollow)
         return;
-    [self mutateAttachmentsIn: rev
-                    withBlock: ^NSDictionary *(NSString *name, NSDictionary *attachment) {
+    [rev mutateAttachments: ^NSDictionary *(NSString *name, NSDictionary *attachment) {
         int revPos = [attachment[@"revpos"] intValue];
         bool includeAttachment = (revPos == 0 || revPos >= minRevPos);
         bool stubItOut = !includeAttachment && !attachment[@"stub"];
@@ -471,8 +449,7 @@ static bool digestToBlobKey(NSString* digest, CBLBlobKey* key) {
 // Replaces the "follows" key with the real attachment data in all attachments to 'doc'.
 - (BOOL) inlineFollowingAttachmentsIn: (CBL_MutableRevision*)rev error: (NSError**)outError {
     __block NSError *error = nil;
-    [[self class] mutateAttachmentsIn: rev
-                            withBlock:
+    [rev mutateAttachments:
         ^NSDictionary *(NSString *name, NSDictionary *attachment) {
             if (!attachment[@"follows"])
                 return attachment;
@@ -500,7 +477,7 @@ static bool digestToBlobKey(NSString* digest, CBLBlobKey* key) {
                                    status: (CBLStatus*)outStatus
 {
     // If there are no attachments in the new rev, there's nothing to do:
-    NSDictionary* revAttachments = $castIf(NSDictionary, rev[@"_attachments"]);
+    NSDictionary* revAttachments = rev.attachments;
     if (revAttachments.count == 0 || rev.deleted) {
         *outStatus = kCBLStatusOK;
         return @{};
@@ -584,7 +561,7 @@ static bool digestToBlobKey(NSString* digest, CBLBlobKey* key) {
     Assert(rev);
     
     // If there are no attachments in the new rev, there's nothing to do:
-    NSDictionary* revAttachments = rev[@"_attachments"];
+    NSDictionary* revAttachments = rev.attachments;
     if (revAttachments.count == 0 || rev.deleted)
         return kCBLStatusOK;
     
@@ -631,7 +608,7 @@ static bool digestToBlobKey(NSString* digest, CBLBlobKey* key) {
                                                                       boundary: nil];
     [writer setNextPartsHeaders: @{@"Content-Type": @"application/json"}];
     [writer addData: rev.asJSON];
-    NSDictionary* attachments = rev[@"_attachments"];
+    NSDictionary* attachments = rev.attachments;
     for (NSString* attachmentName in attachments) {
         NSDictionary* attachment = attachments[attachmentName];
         if (attachment[@"follows"]) {
@@ -675,7 +652,7 @@ static bool digestToBlobKey(NSString* digest, CBLBlobKey* key) {
     }
 
     // Update the _attachments dictionary:
-    NSMutableDictionary* attachments = [oldRev[@"_attachments"] mutableCopy];
+    NSMutableDictionary* attachments = [oldRev.attachments mutableCopy];
     if (!attachments)
         attachments = $mdict();
     if (body) {

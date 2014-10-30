@@ -27,6 +27,7 @@
 #import "CBLManager+Internal.h"
 #import "CBLMisc.h"
 #import "MYBlockUtils.h"
+#import "ExceptionUtils.h"
 
 #if TARGET_OS_IPHONE
 #import <UIKit/UIApplication.h>
@@ -34,7 +35,7 @@
 
 
 // NOTE: This file contains mostly just public-API method implementations.
-// The lower-level stuff is in CBLDatabase.m, etc.
+// The lower-level stuff is in CBLDatabase+Internal.m, etc.
 
 
 // Size of document cache: max # of otherwise-unreferenced docs that will be kept in memory.
@@ -52,8 +53,6 @@ static id<CBLFilterCompiler> sFilterCompiler;
 @implementation CBLDatabase
 {
     CBLCache* _docCache;
-    CBLModelFactory* _modelFactory;  // used in category method in CBLModelFactory.m
-    NSMutableSet* _unsavedModelsMutable;   // All CBLModels that have unsaved changes
     NSMutableSet* _allReplications;
 }
 
@@ -82,8 +81,6 @@ static id<CBLFilterCompiler> sFilterCompiler;
                                                      name: UIApplicationDidEnterBackgroundNotification
                                                    object: nil];
 #endif
-        if (0)
-            _modelFactory = nil;  // appeases static analyzer
     }
     return self;
 }
@@ -91,8 +88,8 @@ static id<CBLFilterCompiler> sFilterCompiler;
 
 - (void)dealloc {
     if (_isOpen) {
-        //Warn(@"%@ dealloced without being closed first!", self);
-        [self close];
+        Assert(!_manager);
+        [self _close];
     }
     [[NSNotificationCenter defaultCenter] removeObserver: self];
 }
@@ -113,17 +110,15 @@ static id<CBLFilterCompiler> sFilterCompiler;
     NSNotification* n = [NSNotification notificationWithName: kCBLDatabaseChangeNotification
                                                       object: self
                                                     userInfo: userInfo];
-    NSNotificationQueue* queue = [NSNotificationQueue defaultQueue];
-    [queue enqueueNotification: n
-                  postingStyle: NSPostASAP 
-                  coalesceMask: NSNotificationNoCoalescing
-                      forModes: @[NSRunLoopCommonModes]];
+    [self postNotification:n];
 }
 
 
 #if TARGET_OS_IPHONE
 - (void) appBackgrounding: (NSNotification*)n {
-    [self autosaveAllModels: nil];
+    [self doAsync: ^{
+        [self autosaveAllModels: nil];
+    }];
 }
 #endif
 
@@ -133,19 +128,26 @@ static id<CBLFilterCompiler> sFilterCompiler;
 }
 
 
+static void catchInBlock(void (^block)()) {
+    @try {
+        block();
+    }catchAndReport(@"-[CBLDatabase doAsync:]");
+}
+
+
 - (void) doAsync: (void (^)())block {
     if (_dispatchQueue)
-        dispatch_async(_dispatchQueue, block);
+        dispatch_async(_dispatchQueue, ^{catchInBlock(block);});
     else
-        MYOnThread(_thread, block);
+        MYOnThread(_thread, ^{catchInBlock(block);});
 }
 
 
 - (void) doSync: (void (^)())block {
     if (_dispatchQueue)
-        dispatch_sync(_dispatchQueue, block);
+        dispatch_sync(_dispatchQueue, ^{catchInBlock(block);});
     else
-        MYOnThreadSynchronously(_thread, block);
+        MYOnThreadSynchronously(_thread, ^{catchInBlock(block);});
 }
 
 
@@ -155,7 +157,7 @@ static id<CBLFilterCompiler> sFilterCompiler;
         dispatch_after(popTime, _dispatchQueue, block);
     } else {
         //FIX: This schedules on the _current_ thread, not _thread!
-        MYAfterDelay(delay, block);
+        MYAfterDelay(delay, ^{catchInBlock(block);});
     }
 }
 
@@ -172,39 +174,25 @@ static id<CBLFilterCompiler> sFilterCompiler;
 }
 
 
-- (BOOL) close {
-    (void)[self saveAllModels: NULL];  // ?? Or should I return NO if this fails?
-
-    if (![self closeInternal])
+- (BOOL) close: (NSError**)outError {
+    if (![self saveAllModels: outError])
         return NO;
-
-    [self _clearDocumentCache];
-    _modelFactory = nil;
-    return YES;
-}
-
-
-- (BOOL) closeForDeletion {
-    // There is no need to save any changes!
-
-    // This causes error because the collection is changed while enumerating
-    //for (CBLModel* model in _unsavedModelsMutable)
-    //    model.needsSave = false;
-    _unsavedModelsMutable = nil;
-    [self close];
-    [_manager _forgetDatabase: self];
+    for (CBLReplication* repl in self.allReplications)
+        [repl stop];
+    [self _close];
     return YES;
 }
 
 
 - (BOOL) deleteDatabase: (NSError**)outError {
     LogTo(CBLDatabase, @"Deleting %@", _path);
-    [[NSNotificationCenter defaultCenter] postNotificationName: CBL_DatabaseWillBeDeletedNotification
+    [[NSNotificationCenter defaultCenter] postNotificationName:CBL_DatabaseWillBeDeletedNotification
                                                         object: self];
-    if (_isOpen && ![self closeForDeletion])
-        return NO;
-    [_manager _forgetDatabase: self];
-    [[NSNotificationCenter defaultCenter] removeObserver: self];
+    [self _close];
+
+    // Wait for all threads to close this database file:
+    [_manager.shared forgetDatabaseNamed: _name];
+
     if (!self.exists) {
         return YES;
     }
@@ -254,8 +242,11 @@ static id<CBLFilterCompiler> sFilterCompiler;
 
 - (CBLDocument*) documentWithID: (NSString*)docID mustExist: (BOOL)mustExist {
     CBLDocument* doc = (CBLDocument*) [_docCache resourceWithCacheKey: docID];
-    if (doc)
+    if (doc) {
+        if (mustExist && doc.currentRevision == nil)  // loads current revision from db
+            return nil;
         return doc;
+    }
     if (docID.length == 0)
         return nil;
     doc = [[CBLDocument alloc] initWithDatabase: self documentID: docID];
@@ -436,11 +427,11 @@ static NSString* makeLocalDocID(NSString* docID) {
 }
 
 
-- (CBLReplication*) replicationToURL: (NSURL*)url {
+- (CBLReplication*) createPushReplication: (NSURL*)url {
     return [[CBLReplication alloc] initWithDatabase: self remote: url pull: NO];
 }
 
-- (CBLReplication*) replicationFromURL: (NSURL*)url {
+- (CBLReplication*) createPullReplication: (NSURL*)url {
     return [[CBLReplication alloc] initWithDatabase: self remote: url pull: YES];
 }
 
@@ -451,44 +442,6 @@ static NSString* makeLocalDocID(NSString* docID) {
     return nil;
 }
 
-
-#ifdef CBL_DEPRECATED
-- (CBLDocument*) untitledDocument {return [self createDocument];}
-- (void) clearDocumentCache {[self _clearDocumentCache];}
-- (CBLDocument*) cachedDocumentWithID: (NSString*)docID {
-    return [self _cachedDocumentWithID: docID];
-}
-- (NSDictionary*) getLocalDocumentWithID: (NSString*)localDocID {
-    return [self existingLocalDocumentWithID: localDocID];
-}
-- (CBLQuery*) queryAllDocuments {return [self createAllDocumentsQuery];}
-- (void) defineValidation: (NSString*)validationName asBlock: (CBLValidationBlock)validationBlock {
-    [self setValidationNamed: validationName asBlock: validationBlock];
-}
-- (void) defineFilter: (NSString*)filterName asBlock: (CBLFilterBlock)filterBlock {
-    [self setFilterNamed: filterName asBlock: filterBlock];
-}
-- (CBLReplication*) pushToURL: (NSURL*)url {
-    return [self replicationToURL: url];
-}
-- (CBLReplication*) pullFromURL: (NSURL*)url {
-    return [self replicationFromURL: url];
-}
-- (NSArray*) replicationsWithURL: (NSURL*)otherDbURL exclusively: (bool)exclusively {
-    if (exclusively) {
-        for (CBLReplication* repl in self.allReplications)
-            if (!$equal(repl.remoteURL, otherDbURL))
-                [repl stop];
-    }
-    CBLReplication* pull = [self existingReplicationWithURL: otherDbURL pull: YES];
-    if (!pull)
-        pull = [self replicationFromURL: otherDbURL];
-    CBLReplication* push = [self existingReplicationWithURL: otherDbURL pull: NO];
-    if (!push)
-        push = [self replicationToURL: otherDbURL];
-    return (pull && push) ? @[pull, push] : nil;
-}
-#endif
 
 @end
 

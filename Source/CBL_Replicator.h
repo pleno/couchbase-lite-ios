@@ -8,9 +8,10 @@
 
 #import <Foundation/Foundation.h>
 
-@class CBLDatabase, CBL_RevisionList, CBLBatcher, CBLReachability;
+@class CBLDatabase, CBL_Revision, CBL_RevisionList, CBLBatcher, CBLReachability;
 @protocol CBLAuthorizer;
 
+typedef CBL_Revision* (^RevisionBodyTransformationBlock)(CBL_Revision*);
 
 /** Posted when changesProcessed or changesTotal changes. */
 extern NSString* CBL_ReplicatorProgressChangedNotification;
@@ -78,6 +79,9 @@ extern NSString* CBL_ReplicatorStoppedNotification;
     CBL_ReplicatorStoppedNotification will be posted when it finally stops. */
 - (void) stop;
 
+/** Setting suspended to YES pauses the replicator. */
+@property (nonatomic) BOOL suspended;
+
 /** Is the replicator running? (Observable) */
 @property (readonly, nonatomic) BOOL running;
 
@@ -108,6 +112,11 @@ extern NSString* CBL_ReplicatorStoppedNotification;
 /** Timeout interval for HTTP requests sent by this replicator.
     (Derived from options key "connection_timeout", in milliseconds.) */
 @property (readonly) NSTimeInterval requestTimeout;
+
+/** Hook for transforming document body, e.g., encryption and decryption during replication */
+@property (strong, nonatomic) RevisionBodyTransformationBlock revisionBodyTransformationBlock;
+
+- (CBL_Revision *) transformRevision:(CBL_Revision *)rev;
 
 @end
 

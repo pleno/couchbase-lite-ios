@@ -13,61 +13,45 @@
 //  either express or implied. See the License for the specific language governing permissions
 //  and limitations under the License.
 
-#import "CouchbaseLitePrivate.h"
-#import "CBLModelArray.h"
-#import "CBLInternal.h"
-#import "Test.h"
-
-
 #if DEBUG
-
-
-static CBLDatabase* createEmptyDB(void) {
-    CBLManager* dbmgr = [CBLManager sharedInstance];
-    CAssert(dbmgr);
-    NSError* error;
-    CBLDatabase* db = [dbmgr createEmptyDatabaseNamed: @"test_db" error: &error];
-    CAssert(db, @"Couldn't create db: %@", error);
-    return db;
-}
-
-
-static void closeTestDB(CBLDatabase* db) {
-    CAssert(db != nil);
-    CAssert([db close]);
-}
-
-
-static CBLDatabase* reopenTestDB(CBLDatabase* db) {
-    closeTestDB(db);
-    [[CBLManager sharedInstance] _forgetDatabase: db];
-    NSError* error;
-    CBLDatabase* db2 = [[CBLManager sharedInstance] databaseNamed: @"test_db" error: &error];
-    CAssert(db2, @"Couldn't reopen db: %@", error);
-    CAssert(db2 != db, @"reopenTestDB couldn't make a new instance");
-    return db2;
-}
+#import "APITestUtils.h"
+#import "CBLModelArray.h"
 
 
 #pragma mark - TEST MODEL:
 
 
-@interface TestSubModel : NSObject <CBLJSONEncoding>
-@property (copy) NSString *firstName, *lastName;
+@interface CBL_TestSubModel : NSObject <CBLJSONEncoding>
+- (instancetype) initWithFirstName: (NSString*)firstName lastName: (NSString*)lastName;
+@property (readonly, copy, nonatomic) NSString *firstName, *lastName;
 @end
 
 
-@implementation TestSubModel
+@interface CBL_TTestMutableSubModel : CBL_TestSubModel
+@property (copy, nonatomic) NSString *firstName, *lastName;
+@end
 
-@synthesize firstName, lastName;
 
-- (id) initWIthJSON:(id)jsonObject {
+@implementation CBL_TestSubModel
+{
+    @protected
+    NSString* _firstName, *_lastName;
+}
+
+@synthesize firstName=_firstName, lastName=_lastName;
+
+- (instancetype) initWithFirstName: (NSString*)first lastName: (NSString*)last {
     self = [super init];
     if (self) {
-        self.firstName = [jsonObject objectForKey: @"first"];
-        self.lastName = [jsonObject objectForKey: @"last"];
+        _firstName = first;
+        _lastName = last;
     }
     return self;
+}
+
+- (id) initWithJSON:(id)jsonObject {
+    return [self initWithFirstName: jsonObject[@"first"]
+                          lastName: jsonObject[@"last"]];
 }
 
 - (id) encodeAsJSON {
@@ -81,8 +65,30 @@ static CBLDatabase* reopenTestDB(CBLDatabase* db) {
 @end
 
 
+@implementation CBL_TTestMutableSubModel
+{
+    CBLOnMutateBlock _onMutate;
+}
 
-@interface TestModel : CBLModel
+- (void) setOnMutate:(CBLOnMutateBlock)onMutate {
+    _onMutate = onMutate;
+}
+
+- (void) setFirstName:(NSString *)firstName {
+    _firstName = [firstName copy];
+    if (_onMutate) _onMutate();
+}
+
+- (void) setLastName:(NSString *)lastName {
+    _lastName = [lastName copy];
+    if (_onMutate) _onMutate();
+}
+
+@end
+
+
+
+@interface CBL_TestModel : CBLModel
 @property int number;
 @property unsigned int uInt;
 @property NSInteger nsInt;
@@ -104,12 +110,15 @@ static CBLDatabase* reopenTestDB(CBLDatabase* db) {
 @property NSData* data;
 @property NSDate* date;
 @property NSDecimalNumber* decimal;
-@property TestModel* other;
+@property NSURL* url;
+@property CBL_TestModel* other;
 @property NSArray* strings;
 @property NSArray* dates;
 @property NSArray* others;
+@property NSDictionary* dict;
 
-@property TestSubModel* subModel;
+@property CBL_TestSubModel* subModel;
+@property CBL_TTestMutableSubModel* mutableSubModel;
 @property NSArray* subModels;
 
 @property int Capitalized;
@@ -118,12 +127,12 @@ static CBLDatabase* reopenTestDB(CBLDatabase* db) {
 @end
 
 
-@implementation TestModel
+@implementation CBL_TestModel
 
 @dynamic number, uInt, sInt16, uInt16, sInt8, uInt8, nsInt, nsUInt, sInt32, uInt32;
-@dynamic sInt64, uInt64, boolean, boolObjC, floaty, doubly;
-@dynamic str, data, date, decimal, other, strings, dates, others, Capitalized;
-@dynamic subModel, subModels;
+@dynamic sInt64, uInt64, boolean, boolObjC, floaty, doubly, dict;
+@dynamic str, data, date, decimal, url, other, strings, dates, others, Capitalized;
+@dynamic subModel, subModels, mutableSubModel;
 @synthesize reloadCount;
 
 - (void) didLoadFromDocument {
@@ -132,7 +141,7 @@ static CBLDatabase* reopenTestDB(CBLDatabase* db) {
 }
 
 + (Class) othersItemClass {
-    return [TestModel class];
+    return [CBL_TestModel class];
 }
 
 + (Class) datesItemClass {
@@ -140,7 +149,7 @@ static CBLDatabase* reopenTestDB(CBLDatabase* db) {
 }
 
 + (Class) subModelsItemClass {
-    return [TestSubModel class];
+    return [CBL_TestSubModel class];
 }
 
 @end
@@ -160,7 +169,7 @@ TestCase(API_ModelDynamicProperties) {
     NSData* data = [@"ASCII" dataUsingEncoding: NSUTF8StringEncoding];
 
     CBLDatabase* db = createEmptyDB();
-    TestModel* model = [[TestModel alloc] initWithNewDocumentInDatabase: db];
+    CBL_TestModel* model = [[CBL_TestModel alloc] initWithNewDocumentInDatabase: db];
 
     TEST_PROPERTY(number, 1337);
     TEST_PROPERTY(number, INT_MAX);
@@ -211,45 +220,102 @@ TestCase(API_ModelDynamicProperties) {
     CAssertEqual(model.strings, strings);
     CAssertEqual(model.data, data);
 
+    NSURL* url = [NSURL URLWithString: @"http://bogus"];
+    model.url = url;
+    CAssertEqual(model.url, url);
+
     Log(@"Model: %@", [CBLJSON stringWithJSONObject: model.propertiesToSave options: 0 error: NULL]);
+    [db _close];
 }
 
 
 TestCase(API_ModelEncodableProperties) {
     CBLDatabase* db = createEmptyDB();
-    TestModel* model = [[TestModel alloc] initWithNewDocumentInDatabase: db];
+    CBL_TestModel* model = [[CBL_TestModel alloc] initWithNewDocumentInDatabase: db];
 
-    TestSubModel* name = [[TestSubModel alloc] init];
-    name.firstName = @"Jens";
-    name.lastName = @"Alfke";
+    CBL_TestSubModel* name = [[CBL_TestSubModel alloc] initWithFirstName: @"Jens" lastName: @"Alfke"];
     model.subModel = name;
     AssertEq(model.subModel, name);
     AssertEq([model getValueOfProperty: @"subModel"], name);
-    NSDictionary* props = model.propertiesToSave;
-    CAssertEqual(props, (@{@"subModel": @{@"first": @"Jens", @"last": @"Alfke"}}));
+    NSMutableDictionary* props = [model.propertiesToSave mutableCopy];
+    [props removeObjectForKey: @"_id"];
+    CAssertEqual(props, (@{@"subModel": @{@"first": @"Jens",
+                                          @"last": @"Alfke"}}));
 
     CBLDocument* doc2 = [db createDocument];
     CAssert([doc2 putProperties: props error: NULL]);
-    TestModel* model2 = [[TestModel alloc] initWithDocument: doc2];
+    CBL_TestModel* model2 = [[CBL_TestModel alloc] initWithDocument: doc2];
     CAssertEqual(model2.subModel, name);
 
     // Now test array of encodable objects:
-    TestSubModel* name2 = [[TestSubModel alloc] init];
-    name2.firstName = @"Naomi";
-    name2.lastName = @"Pearl";
+    CBL_TestSubModel* name2 = [[CBL_TestSubModel alloc] initWithFirstName: @"Naomi" lastName: @"Pearl"];
     model.subModel = nil;
     NSArray* subModels = @[name, name2];
     model.subModels = subModels;
     AssertEqual(model.subModels, subModels);
     AssertEq([model getValueOfProperty: @"subModels"], subModels);
-    props = model.propertiesToSave;
+
+    CBL_TTestMutableSubModel* name3 = [[CBL_TTestMutableSubModel alloc] initWithFirstName: @"Jed" lastName: @"Clampett"];
+    model.mutableSubModel = name3;
+    AssertEq(model.mutableSubModel, name3);
+    AssertEq([model getValueOfProperty: @"mutableSubModel"], name3);
+
+    props = [model.propertiesToSave mutableCopy];
+    [props removeObjectForKey: @"_id"];
     CAssertEqual(props, (@{@"subModels": @[@{@"first": @"Jens", @"last": @"Alfke"},
-                                           @{@"first": @"Naomi", @"last": @"Pearl"}]}));
+                                           @{@"first": @"Naomi", @"last": @"Pearl"}],
+                           @"mutableSubModel": @{@"first": @"Jed", @"last": @"Clampett"}}));
 
     CBLDocument* doc3 = [db createDocument];
     CAssert([doc3 putProperties: props error: NULL]);
-    TestModel* model3 = [[TestModel alloc] initWithDocument: doc3];
+    CBL_TestModel* model3 = [[CBL_TestModel alloc] initWithDocument: doc3];
+    Assert(!model3.needsSave);
     CAssertEqual(model3.subModels, subModels);
+    CAssertEqual(model3.mutableSubModel, name3);
+
+    // Mutate the submodel in place and make sure the model's serialization changed:
+    name3 = model3.mutableSubModel;
+    AssertEqual(name3.lastName, @"Clampett");
+    Assert(!model3.needsSave);
+    name3.lastName = @"Pookie";
+    Assert(model3.needsSave);
+    props = [model3.propertiesToSave mutableCopy];
+    CAssertEqual(props, (@{@"subModels": @[@{@"first": @"Jens", @"last": @"Alfke"},
+                                           @{@"first": @"Naomi", @"last": @"Pearl"}],
+                           @"mutableSubModel": @{@"first": @"Jed", @"last": @"Pookie"},
+                           @"_id": doc3.documentID,
+                           @"_rev": doc3.currentRevisionID}));
+    [db _close];
+}
+
+
+TestCase(API_ModelEncodablePropertiesNilValue) { // See #247
+    RequireTestCase(API_ModelEncodableProperties);
+    CBLDatabase* db = createEmptyDB();
+
+    CBL_TestModel* emptyModel = [[CBL_TestModel alloc] initWithNewDocumentInDatabase: db];
+    AssertNil(emptyModel.mutableSubModel);
+    NSString* documentID = [[emptyModel document] documentID];
+    emptyModel = nil;
+    CBLDocument *document = [db documentWithID:documentID];
+    emptyModel = [[CBL_TestModel alloc] initWithDocument:document];
+    AssertNil(emptyModel.mutableSubModel);
+
+    [db _close];
+}
+
+
+TestCase(API_ModelTypeProperty) {
+    CBLDatabase* db = createEmptyDB();
+    CBL_TestModel* model = [[CBL_TestModel alloc] initWithNewDocumentInDatabase: db];
+
+    model.type = @"Dummy";
+    CAssertEqual(model.type, @"Dummy");
+    CAssertEqual([model getValueOfProperty:@"type"], @"Dummy");
+    CAssertEqual(model.propertiesToSave, (@{@"_id": model.document.documentID,
+                                            @"type": @"Dummy"}));
+
+    [db _close];
 }
 
 
@@ -258,7 +324,7 @@ TestCase(API_ModelDeleteProperty) {
     NSData* data = [@"ASCII" dataUsingEncoding: NSUTF8StringEncoding];
 
     CBLDatabase* db = createEmptyDB();
-    TestModel* model = [[TestModel alloc] initWithNewDocumentInDatabase: db];
+    CBL_TestModel* model = [[CBL_TestModel alloc] initWithNewDocumentInDatabase: db];
     model.number = 1337;
     model.str = @"LEET";
     model.strings = strings;
@@ -279,7 +345,7 @@ TestCase(API_ModelDeleteProperty) {
     model.data = nil;
     CAssertEqual(model.data, nil);      // Tests issue CouchCocoa #73
 
-    [db close];
+    [db _close];
 }
 
 
@@ -287,16 +353,17 @@ TestCase(API_SaveModel) {
     NSDate* date = [NSDate dateWithTimeIntervalSinceReferenceDate: 392773252];
     NSArray* dates = @[date, [NSDate dateWithTimeIntervalSinceReferenceDate: 392837521]];
     NSDecimalNumber* decimal = [NSDecimalNumber decimalNumberWithString: @"12345.6789"];
+    NSURL* url = [NSURL URLWithString: @"http://bogus"];
 
     CBLDatabase* db = createEmptyDB();
     NSString* modelID, *model2ID, *model3ID;
     {
-        TestModel* model = [[TestModel alloc] initWithNewDocumentInDatabase: db];
+        CBL_TestModel* model = [[CBL_TestModel alloc] initWithNewDocumentInDatabase: db];
         CAssert(model != nil);
         CAssert(model.isNew);
         CAssert(!model.needsSave);
-        CAssertEq(model.propertiesToSave.count, 0u);
         modelID = model.document.documentID;
+        CAssertEqual(model.propertiesToSave, @{@"_id": modelID});
 
         // Create and populate a TestModel:
         model.number = 1337;
@@ -306,21 +373,24 @@ TestCase(API_SaveModel) {
         model.date = date;
         model.dates = dates;
         model.decimal = decimal;
+        model.url = url;
 
         CAssert(model.isNew);
         CAssert(model.needsSave);
-        CAssertEqual(model.propertiesToSave, (@{@"number": @(1337),
+        CAssertEqual(model.propertiesToSave, (@{@"_id": model.document.documentID,
+                                                @"number": @(1337),
                                                 @"str": @"LEET",
                                                 @"strings": @[@"fee", @"fie", @"foe", @"fum"],
                                                 @"data": @"QVNDSUk=",
                                                 @"date": @"2013-06-12T23:40:52.000Z",
                                                 @"dates": @[@"2013-06-12T23:40:52.000Z",
                                                             @"2013-06-13T17:32:01.000Z"],
-                                                @"decimal": @"12345.6789"}));
+                                                @"decimal": @"12345.6789",
+                                                @"url": @"http://bogus"}));
 
-        TestModel* model2 = [[TestModel alloc] initWithNewDocumentInDatabase: db];
+        CBL_TestModel* model2 = [[CBL_TestModel alloc] initWithNewDocumentInDatabase: db];
         model2ID = model2.document.documentID;
-        TestModel* model3 = [[TestModel alloc] initWithNewDocumentInDatabase: db];
+        CBL_TestModel* model3 = [[CBL_TestModel alloc] initWithNewDocumentInDatabase: db];
         model3ID = model3.document.documentID;
 
         model.other = model3;
@@ -334,6 +404,7 @@ TestCase(API_SaveModel) {
         CAssertEqual(model.date, [NSDate dateWithTimeIntervalSinceReferenceDate: 392773252]);
         CAssertEqual(model.dates, dates);
         CAssertEqual(model.decimal, decimal);
+        CAssertEqual(model.url, url);
         CAssertEq(model.other, model3);
         CAssertEqual(model.others, (@[model2, model3]));
 
@@ -352,6 +423,7 @@ TestCase(API_SaveModel) {
                                @"date": @"2013-06-12T23:40:52.000Z",
                                @"dates": @[@"2013-06-12T23:40:52.000Z", @"2013-06-13T17:32:01.000Z"],
                                @"decimal": @"12345.6789",
+                               @"url": @"http://bogus",
                                @"other": model3.document.documentID,
                                @"others": @[model2.document.documentID, model3.document.documentID],
                                @"_id": props[@"_id"],
@@ -387,7 +459,7 @@ TestCase(API_SaveModel) {
         // Close/reopen the database and verify again:
         db = reopenTestDB(db);
         CBLDocument* doc = [db documentWithID: modelID];
-        TestModel* modelAgain = [TestModel modelForDocument: doc];
+        CBL_TestModel* modelAgain = [CBL_TestModel modelForDocument: doc];
         CAssertEq(modelAgain.number, 4321);
         CAssertEqual(modelAgain.str, @"LEET");
         CAssertEqual(modelAgain.strings, (@[@"fee", @"fie", @"foe", @"fum"]));
@@ -395,15 +467,60 @@ TestCase(API_SaveModel) {
         CAssertEqual(modelAgain.date, [NSDate dateWithTimeIntervalSinceReferenceDate: 392773252]);
         CAssertEqual(modelAgain.dates, dates);
         CAssertEqual(modelAgain.decimal, decimal);
+        CAssertEqual(modelAgain.url, url);
 
-        TestModel *other = modelAgain.other;
+        CBL_TestModel *other = modelAgain.other;
         CAssertEqual(modelAgain.other.document.documentID, model3ID);
         NSArray* others = modelAgain.others;
         CAssertEq(others.count, 2u);
         CAssertEq(others[1], other);
-        CAssertEqual(((TestModel*)others[0]).document.documentID, model2ID);
+        CAssertEqual(((CBL_TestModel*)others[0]).document.documentID, model2ID);
     }
-    [db close];
+    [db _close];
+}
+
+
+TestCase(API_SaveMutatedSubModel) {
+    NSError* error;
+    
+    CBLDatabase* db = createEmptyDB();
+    CBL_TestModel* model = [[CBL_TestModel alloc] initWithNewDocumentInDatabase: db];
+    CBL_TTestMutableSubModel* submodel = [[CBL_TTestMutableSubModel alloc] initWithFirstName: @"Jens" lastName: @"Alfke"];
+    model.mutableSubModel = submodel;
+    NSMutableDictionary* props = [model.propertiesToSave mutableCopy];
+    [props removeObjectForKey: @"_id"];
+    CAssertEqual(props, (@{@"mutableSubModel":@{@"first": @"Jens", @"last": @"Alfke"}}));
+    [model save: &error];
+    CAssertNil(error);
+    
+    submodel.firstName = @"Pasin";
+    submodel.lastName = @"Suri";
+    props = [[model propertiesToSave] mutableCopy];
+    [props removeObjectForKey: @"_id"];
+    [props removeObjectForKey: @"_rev"];
+    CAssertEqual(props, (@{@"mutableSubModel":@{@"first": @"Pasin", @"last": @"Suri"}}));
+    [model save: &error];
+    CAssertNil(error);
+    
+    submodel = model.mutableSubModel;
+    submodel.firstName = @"Wayne";
+    submodel.lastName = @"Carter";
+    props = [[model propertiesToSave] mutableCopy];
+    [props removeObjectForKey: @"_id"];
+    [props removeObjectForKey: @"_rev"];
+    CAssertEqual(props, (@{@"mutableSubModel":@{@"first": @"Wayne", @"last": @"Carter"}}));
+    [model save: &error];
+    CAssertNil(error);
+}
+
+
+TestCase(API_SaveModelWithNaNProperty) {
+    CBLDatabase* db = createEmptyDB();
+    CBL_TestModel* model = [[CBL_TestModel alloc] initWithNewDocumentInDatabase: db];
+    model.doubly = sqrt(-1);
+    NSError* error;
+    [model save: &error];
+    CAssertEq(error.code, 400);
 }
 
 
@@ -415,7 +532,7 @@ TestCase(API_ModelAttachments) {
     NSData* attData = [@"Ceci n'est pas une pipe." dataUsingEncoding: NSUTF8StringEncoding];
     CBLDocument* doc;
     {
-        TestModel* model = [[TestModel alloc] initWithNewDocumentInDatabase: db];
+        CBL_TestModel* model = [[CBL_TestModel alloc] initWithNewDocumentInDatabase: db];
         doc = model.document;
         model.number = 1337;
         CAssert([model save: &error], @"Initial failed: %@", error);
@@ -433,7 +550,7 @@ TestCase(API_ModelAttachments) {
         CAssert([model save: &error], @"Save after updating number failed: %@", error);
     }
     {
-        TestModel* model = [TestModel modelForDocument: doc];
+        CBL_TestModel* model = [CBL_TestModel modelForDocument: doc];
         CAssertEq(model.number, 23);
         CBLAttachment* attachment = [model attachmentNamed: @"Caption.txt"];
         CAssertEqual(attachment.content, attData);
@@ -447,13 +564,34 @@ TestCase(API_ModelAttachments) {
         [model setAttachmentNamed: @"Caption.txt" withContentType: @"text/plain" content:newAttData];
         CAssert([model save: &error], @"Final save failed: %@", error);
     }
-    [db close];
+    [db _close];
+}
+
+
+TestCase(API_ModelPropertyObservation) {
+    // For https://github.com/couchbase/couchbase-lite-ios/issues/244
+    CBLDatabase* db = createEmptyDB();
+    CBL_TestModel* model = [[CBL_TestModel alloc] initWithNewDocumentInDatabase: db];
+    id observer = [NSObject new];
+
+    @autoreleasepool {
+        model.dict = @{@"name": @"Puddin' Tane"};
+        [model addObserver: observer forKeyPath: @"dict.name" options: 0 context: NULL];
+        [model save: NULL];
+    }
+    [model removeObserver: observer forKeyPath: @"dict.name"];
+    [db _close];
 }
 
 
 TestCase(API_Model) {
     RequireTestCase(API_ModelDynamicProperties);
+    RequireTestCase(API_ModelEncodableProperties);
+    RequireTestCase(API_ModelEncodablePropertiesNilValue);
+    RequireTestCase(API_ModelTypeProperty);
     RequireTestCase(API_SaveModel);
+    RequireTestCase(API_SaveMutatedSubModel);
+    RequireTestCase(API_SaveModelWithNaNProperty);
     RequireTestCase(API_ModelDeleteProperty);
     RequireTestCase(API_ModelAttachments);
 }
