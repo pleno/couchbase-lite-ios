@@ -38,12 +38,6 @@
 #define GCDAsyncWritePacket         CBL_GCDAsyncWritePacket
 #define GCDAsyncSpecialPacket       CBL_GCDAsyncSpecialPacket
 
-// Rename the CocoaLumberjack classes to avoid collisions:
-#define DDLog                       CBL_DDLog
-#define DDLogMessage                CBL_DDLogMessage
-#define DDAbstractLogger            CBL_DDAbstractLogger
-#define DDLoggerNode                CBL_DDLoggerNode
-
 // Rename the CocoaHTTPServer classes to avoid collisions:
 #define HTTPAsyncFileResponse       CBL_HTTPAsyncFileResponse
 #define HTTPAuthenticationRequest   CBL_HTTPAuthenticationRequest

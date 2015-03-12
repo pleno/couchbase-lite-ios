@@ -14,7 +14,7 @@
 //  and limitations under the License.
 
 #import "CBLJSONReader.h"
-#import <yajl/yajl_parse.h>
+#import "yajl/yajl_parse.h"
 
 
 @interface CBLGenericArrayMatcher : CBLJSONArrayMatcher

@@ -407,9 +407,28 @@
 
 - (NSDictionary*) propertiesToSave {
     NSMutableDictionary* properties = [_document.properties mutableCopy];
-    if (!properties)
-        properties = [NSMutableDictionary dictionaryWithObject: _document.documentID
-                                                        forKey: @"_id"];
+    
+    /*
+     * Trying to fix #261
+     * https://www.fabric.io/pleno/ios/apps/no.familieplan.familieplan/issues/548430db65f8dfea15455513
+     * Looks like sometimes the _document.documentID is NIL... let's see if here we can create this empty dictionary
+     * and later on saving it wil fail controlled
+     *  -[__NSPlaceholderDictionary initWithObjects:forKeys:count:]: attempt to insert nil object from objects[0]
+     */
+    
+    if (!properties) {
+        if (_document.documentID != nil) {
+            properties = [NSMutableDictionary dictionaryWithObject: _document.documentID
+                                                            forKey: @"_id"];
+        } else {
+            properties = [[NSMutableDictionary alloc] init];
+        }
+    }
+    
+    /*
+     * End of Fix
+     */
+    
     for (NSString* key in _changedNames) {
         id value = _properties[key];
         [properties setValue: [self externalizePropertyValue: value] forKey: key];
@@ -475,7 +494,9 @@
 + (Class) itemClassForArrayProperty: (NSString*)property {
     SEL sel = NSSelectorFromString([property stringByAppendingString: @"ItemClass"]);
     if ([self respondsToSelector: sel]) {
-        return (Class)objc_msgSend(self, sel);
+        id (*typed_msgSend)(id, SEL) = (void *)objc_msgSend;
+
+        return (Class)typed_msgSend(self, sel);
     }
     return Nil;
 }

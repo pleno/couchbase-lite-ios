@@ -25,6 +25,7 @@
 #import "Test.h"
 #import "MYURLUtils.h"
 #import "GTMNSData+zlib.h"
+#import "CouchbaseLite.h"
 
 
 // Max number of retry attempts for a transient failure, and the backoff time formula

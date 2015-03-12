@@ -16,6 +16,8 @@
 
 #define CBL_DEPRECATED  // Enable deprecated methods.
 
+#define CBL_VERSION_STRING "1.0.206"
+
 #import "CBLManager.h"
 #import "CBLDatabase.h"
 #import "CBLDatabaseChange.h"
