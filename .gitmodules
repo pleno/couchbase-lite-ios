@@ -18,4 +18,4 @@ url=git://github.com/pleno/MYUtilities.git
 	url = git://github.com/snej/sqlite3-unicodesn.git
 [submodule "vendor/WebSockets-Cocoa"]
 	path = vendor/WebSockets-Cocoa
-	url = git://github.com/couchbaselabs/WebSockets-Cocoa.git
+url=git://github.com/mariomash/WebSockets-Cocoa.git
